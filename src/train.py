@@ -175,7 +175,13 @@ def train(args):
 
     # model
     printer.info("Loading model")
-    model = StreamVGGT()
+    model = StreamVGGT(
+        fusion=args.fusion,
+        fusion_heads=args.fusion_heads,
+        fusion_mlp_ratio=args.fusion_mlp_ratio,
+        event_in_chans=args.event_in_chans,
+        debug_fusion=args.debug_fusion,
+    )
     teacher = VGGT()
 
     # model: PreTrainedModel = eval(args.model)
@@ -225,7 +231,7 @@ def train(args):
         total_params += param.numel()
         param.requires_grad = True
 
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'patch_embed'):
+    if args.freeze_rgb_backbone and hasattr(model, 'aggregator') and hasattr(model.aggregator, 'patch_embed'):
         for param in model.aggregator.patch_embed.parameters():
             if param.requires_grad:
                 param.requires_grad = False
@@ -253,6 +259,8 @@ def train(args):
 
 
     # following timm: set wd as 0 for bias and norm layers
+    trainable_param_names = [name for name, p in model.named_parameters() if p.requires_grad]
+    printer.info(f"Trainable modules: {trainable_param_names[:20]}{'...' if len(trainable_param_names) > 20 else ''}")
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     # print(optimizer)
@@ -268,6 +276,25 @@ def train(args):
     optimizer, model, data_loader_train = accelerator.prepare(
         optimizer, model, data_loader_train
     )
+
+    if args.dry_run:
+        printer.info("Running dry-run: single batch forward+loss+backward")
+        model.train(True)
+        batch = next(iter(data_loader_train))
+        if isinstance(batch, dict) and "img" in batch:
+            batch["img"] = (batch["img"] + 1.0) / 2.0
+        elif isinstance(batch, list) and all(isinstance(v, dict) and "img" in v for v in batch):
+            for view in batch:
+                view["img"] = (view["img"] + 1.0) / 2.0
+        result = loss_of_one_batch(
+            batch, model, train_criterion, accelerator, teacher=teacher,
+            inference=False, symmetrize_batch=False, use_amp=bool(args.amp),
+        )
+        loss, _ = result["loss"]
+        loss_scaler(loss, optimizer, parameters=model.parameters(), update_grad=True, clip_grad=1.0)
+        optimizer.zero_grad()
+        printer.info(f"Dry-run OK. loss={float(loss):.6f}")
+        return
 
     def write_log_stats(epoch, train_stats, test_stats):
         if accelerator.is_main_process:
