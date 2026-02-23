@@ -85,6 +85,12 @@ fusion_mlp_ratio: 4.0
 event_in_chans: 8
 debug_fusion: False
 dry_run: False
+train_mode: normal
+mask_ratio: 0.6
+mask_fill: mean
+mae_loss: mse
+mae_head: linear
+mae_log_images: False
 
 num_workers: 12
 world_size: 1
