@@ -237,9 +237,16 @@ def train(args):
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
-        printer.info(
-            model.load_state_dict(ckpt, strict=True)
-        )
+
+        if isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
+            state_dict = ckpt["model"]
+        else:
+            state_dict = ckpt
+
+        load_msg = model.load_state_dict(state_dict, strict=False)
+        printer.info(f"Pretrained load done with strict=False")
+        printer.info(f"Missing keys ({len(load_msg.missing_keys)}): {load_msg.missing_keys[:20]}")
+        printer.info(f"Unexpected keys ({len(load_msg.unexpected_keys)}): {load_msg.unexpected_keys[:20]}")
         del ckpt  # in case it occupies memory
 
     if args.train_mode == "normal":
