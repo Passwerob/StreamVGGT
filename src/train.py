@@ -90,6 +90,15 @@ def _get_single_view_and_event(batch):
     return view, event
 
 
+
+
+def _call_mae_forward(model, **kwargs):
+    if hasattr(model, "mae_forward"):
+        return model.mae_forward(**kwargs)
+    if hasattr(model, "module") and hasattr(model.module, "mae_forward"):
+        return model.module.mae_forward(**kwargs)
+    raise AttributeError(f"{type(model).__name__} has no mae_forward")
+
 def setup_for_distributed(accelerator: Accelerator):
     """
     This function disables printing when not in master process
@@ -323,7 +332,7 @@ def train(args):
         batch = _normalize_batch_images(next(iter(data_loader_train)))
         if args.train_mode == "mae":
             view, event_voxel = _get_single_view_and_event(batch)
-            mae_out = model.mae_forward(
+            mae_out = _call_mae_forward(model,
                 rgb=view["img"],
                 event_voxel=event_voxel,
                 mask_ratio=args.mask_ratio,
@@ -531,7 +540,7 @@ def train_one_epoch(
 
             if args.train_mode == "mae":
                 view, event_voxel = _get_single_view_and_event(batch)
-                result = model.mae_forward(
+                result = _call_mae_forward(model,
                     rgb=view["img"],
                     event_voxel=event_voxel,
                     mask_ratio=args.mask_ratio,
