@@ -63,6 +63,42 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 printer = get_logger(__name__, log_level="DEBUG")
 
 
+def _normalize_batch_images(batch):
+    if isinstance(batch, dict) and "img" in batch:
+        batch["img"] = (batch["img"] + 1.0) / 2.0
+    elif isinstance(batch, list) and all(isinstance(v, dict) and "img" in v for v in batch):
+        for view in batch:
+            view["img"] = (view["img"] + 1.0) / 2.0
+    return batch
+
+
+def _get_single_view_and_event(batch):
+    if isinstance(batch, list):
+        view = batch[0]
+    elif isinstance(batch, dict):
+        view = batch
+    else:
+        raise ValueError(f"Unsupported batch type for MAE mode: {type(batch)}")
+
+    event = None
+    for key in ("event_voxel", "event", "events", "voxel"):
+        if key in view:
+            event = view[key]
+            break
+    if event is None:
+        raise KeyError("MAE mode requires one of ['event_voxel','event','events','voxel'] in batch view dict")
+    return view, event
+
+
+
+
+def _call_mae_forward(model, **kwargs):
+    if hasattr(model, "mae_forward"):
+        return model.mae_forward(**kwargs)
+    if hasattr(model, "module") and hasattr(model.module, "mae_forward"):
+        return model.module.mae_forward(**kwargs)
+    raise AttributeError(f"{type(model).__name__} has no mae_forward")
+
 def setup_for_distributed(accelerator: Accelerator):
     """
     This function disables printing when not in master process
@@ -175,19 +211,30 @@ def train(args):
 
     # model
     printer.info("Loading model")
-    model = StreamVGGT()
-    teacher = VGGT()
+    model = StreamVGGT(
+        fusion=args.fusion,
+        fusion_heads=args.fusion_heads,
+        fusion_mlp_ratio=args.fusion_mlp_ratio,
+        event_in_chans=args.event_in_chans,
+        debug_fusion=args.debug_fusion,
+        mae_head=args.mae_head,
+    )
+    teacher = VGGT() if args.train_mode == "normal" else None
 
     # model: PreTrainedModel = eval(args.model)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
 
 
-    printer.info(f">> Creating train criterion = {args.train_criterion}")
-    train_criterion = eval(args.train_criterion).to(device)
-    printer.info(
-        f">> Creating test criterion = {args.test_criterion or args.train_criterion}"
-    )
-    test_criterion = eval(args.test_criterion or args.criterion).to(device)
+    if args.train_mode == "normal":
+        printer.info(f">> Creating train criterion = {args.train_criterion}")
+        train_criterion = eval(args.train_criterion).to(device)
+        printer.info(
+            f">> Creating test criterion = {args.test_criterion or args.train_criterion}"
+        )
+        test_criterion = eval(args.test_criterion or args.criterion).to(device)
+    else:
+        train_criterion = None
+        test_criterion = None
 
     model.to(device)
 
@@ -199,19 +246,27 @@ def train(args):
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
-        printer.info(
-            model.load_state_dict(ckpt, strict=True)
-        )
+
+        if isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
+            state_dict = ckpt["model"]
+        else:
+            state_dict = ckpt
+
+        load_msg = model.load_state_dict(state_dict, strict=False)
+        printer.info(f"Pretrained load done with strict=False")
+        printer.info(f"Missing keys ({len(load_msg.missing_keys)}): {load_msg.missing_keys[:20]}")
+        printer.info(f"Unexpected keys ({len(load_msg.unexpected_keys)}): {load_msg.unexpected_keys[:20]}")
         del ckpt  # in case it occupies memory
 
-    printer.info("Loading teacher model")
-    ckpt_teacher = torch.load(args.pretrained, map_location=device)
-    teacher.load_state_dict(ckpt_teacher, strict=True)
-    teacher = teacher.to("cuda")
-    for p in teacher.parameters():
-        p.requires_grad = False  
-    teacher.eval()
-    del ckpt_teacher
+    if args.train_mode == "normal":
+        printer.info("Loading teacher model")
+        ckpt_teacher = torch.load(args.pretrained, map_location=device)
+        teacher.load_state_dict(ckpt_teacher, strict=True)
+        teacher = teacher.to("cuda")
+        for p in teacher.parameters():
+            p.requires_grad = False
+        teacher.eval()
+        del ckpt_teacher
 
 
     # freeze
@@ -225,7 +280,7 @@ def train(args):
         total_params += param.numel()
         param.requires_grad = True
 
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'patch_embed'):
+    if args.freeze_rgb_backbone and hasattr(model, 'aggregator') and hasattr(model.aggregator, 'patch_embed'):
         for param in model.aggregator.patch_embed.parameters():
             if param.requires_grad:
                 param.requires_grad = False
@@ -253,6 +308,8 @@ def train(args):
 
 
     # following timm: set wd as 0 for bias and norm layers
+    trainable_param_names = [name for name, p in model.named_parameters() if p.requires_grad]
+    printer.info(f"Trainable modules: {trainable_param_names[:20]}{'...' if len(trainable_param_names) > 20 else ''}")
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     # print(optimizer)
@@ -268,6 +325,33 @@ def train(args):
     optimizer, model, data_loader_train = accelerator.prepare(
         optimizer, model, data_loader_train
     )
+
+    if args.dry_run:
+        printer.info("Running dry-run: single batch forward+loss+backward")
+        model.train(True)
+        batch = _normalize_batch_images(next(iter(data_loader_train)))
+        if args.train_mode == "mae":
+            view, event_voxel = _get_single_view_and_event(batch)
+            mae_out = _call_mae_forward(model,
+                rgb=view["img"],
+                event_voxel=event_voxel,
+                mask_ratio=args.mask_ratio,
+                mask_fill=args.mask_fill,
+                mae_loss=args.mae_loss,
+                fusion=args.fusion,
+                return_images=args.mae_log_images,
+            )
+            loss = mae_out["loss"]
+        else:
+            result = loss_of_one_batch(
+                batch, model, train_criterion, accelerator, teacher=teacher,
+                inference=False, symmetrize_batch=False, use_amp=bool(args.amp),
+            )
+            loss, _ = result["loss"]
+        loss_scaler(loss, optimizer, parameters=model.parameters(), update_grad=True, clip_grad=1.0)
+        optimizer.zero_grad()
+        printer.info(f"Dry-run OK. loss={float(loss):.6f}")
+        return
 
     def write_log_stats(epoch, train_stats, test_stats):
         if accelerator.is_main_process:
@@ -444,12 +528,7 @@ def train_one_epoch(
     for data_iter_step, batch in enumerate(data_iter):
             
         with accelerator.accumulate(model):
-            # change the range of the image to [0, 1]
-            if isinstance(batch, dict) and "img" in batch:
-                batch["img"] = (batch["img"] + 1.0) / 2.0
-            elif isinstance(batch, list) and all(isinstance(v, dict) and "img" in v for v in batch):
-                for view in batch:
-                    view["img"] = (view["img"] + 1.0) / 2.0
+            batch = _normalize_batch_images(batch)
 
             epoch_f = epoch + data_iter_step / len(data_loader)
             # we use a per iteration (instead of per epoch) lr scheduler
@@ -459,18 +538,35 @@ def train_one_epoch(
             epoch_f = epoch + data_iter_step / len(data_loader)
             step = int(epoch_f * len(data_loader))
 
-            result = loss_of_one_batch(
-                batch,
-                model,
-                criterion,
-                accelerator,
-                teacher=teacher,
-                inference=False,
-                symmetrize_batch=False,
-                use_amp=bool(args.amp),
-            )
-      
-            loss, loss_details = result["loss"]  # criterion returns two values
+            if args.train_mode == "mae":
+                view, event_voxel = _get_single_view_and_event(batch)
+                result = _call_mae_forward(model,
+                    rgb=view["img"],
+                    event_voxel=event_voxel,
+                    mask_ratio=args.mask_ratio,
+                    mask_fill=args.mask_fill,
+                    mae_loss=args.mae_loss,
+                    fusion=args.fusion,
+                    return_images=args.mae_log_images,
+                )
+                loss = result["loss"]
+                loss_details = {
+                    "mae_loss": float(loss),
+                    "mask_ratio": float(args.mask_ratio),
+                    "gate": float(result["gate"].item()),
+                }
+            else:
+                result = loss_of_one_batch(
+                    batch,
+                    model,
+                    criterion,
+                    accelerator,
+                    teacher=teacher,
+                    inference=False,
+                    symmetrize_batch=False,
+                    use_amp=bool(args.amp),
+                )
+                loss, loss_details = result["loss"]  # criterion returns two values
 
             loss_value = float(loss)
 
@@ -489,9 +585,6 @@ def train_one_epoch(
                 )
                 optimizer.zero_grad()
 
-            is_metric = batch[0]["is_metric"]
-            curr_num_view = len(batch)
-
             del loss
             
             tb_vis_img = (data_iter_step + 1) % accum_iter == 0 and (
@@ -508,6 +601,8 @@ def train_one_epoch(
             metric_logger.update(step=step)
             #
             metric_logger.update(loss=loss_value, **loss_details)
+            if args.train_mode == "mae" and (data_iter_step + 1) % max(1, args.print_freq) == 0:
+                printer.info(f"[MAE] step={step} mask_ratio={args.mask_ratio:.3f} gate={loss_details['gate']:.6f}")
             #
             if (data_iter_step + 1) % accum_iter == 0 and (
                 (data_iter_step + 1) % (accum_iter * args.print_freq)
@@ -532,6 +627,10 @@ def train_one_epoch(
                     if isinstance(val, dict):
                         continue
                     log_writer.add_scalar("train_" + name, val, step)
+
+                if args.train_mode == "mae" and args.mae_log_images and "pred_rgb" in result:
+                    show = torch.cat([result["rgb"][0:1], result["rgb_masked"][0:1], result["pred_rgb"][0:1]], dim=0)
+                    log_writer.add_images("mae_rgb_gt_masked_pred", show.clamp(0, 1), step)
 
         if (
             data_iter_step % int(args.save_freq * len(data_loader)) == 0

@@ -14,6 +14,7 @@ from streamvggt.layers import PatchEmbed
 from streamvggt.layers.block import Block
 from streamvggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from streamvggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from streamvggt.models.fusion import EventPatchEmbed, CrossAttnBlock, get_rgb_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +67,21 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        fusion="crossattn",
+        fusion_heads=8,
+        fusion_mlp_ratio=4.0,
+        event_in_chans=8,
+        debug_fusion=False,
     ):
         super().__init__()
 
         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
 
+        self.fusion = fusion
+        self.debug_fusion = debug_fusion
+        self.embed_dim = embed_dim
+        self.event_patch_embed = EventPatchEmbed(in_chans=event_in_chans, embed_dim=embed_dim, patch_size=patch_size)
+        self.cross_attn_block = CrossAttnBlock(dim=embed_dim, num_heads=fusion_heads, mlp_ratio=fusion_mlp_ratio)
         # Initialize rotary position embedding if frequency > 0
         self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
         self.position_getter = PositionGetter() if self.rope is not None else None
@@ -188,9 +199,11 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        event_voxels: Optional[torch.Tensor] = None,
         past_key_values=None,
         use_cache=False,
-        past_frame_idx=0
+        past_frame_idx=0,
+        fusion: Optional[str] = None
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
@@ -221,10 +234,34 @@ class Aggregator(nn.Module):
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.reshape(B * S, C_in, H, W)
-        patch_tokens = self.patch_embed(images)
+        patch_tokens = get_rgb_tokens(self.patch_embed, images)
 
-        if isinstance(patch_tokens, dict):
-            patch_tokens = patch_tokens["x_norm_patchtokens"]
+        fusion_mode = self.fusion if fusion is None else fusion
+        if fusion_mode not in {"none", "crossattn"}:
+            raise ValueError(f"Unknown fusion mode: {fusion_mode}")
+
+        if fusion_mode == "crossattn":
+            if event_voxels is None:
+                raise ValueError("fusion=crossattn requires event_voxels")
+            if event_voxels.ndim != 5:
+                raise ValueError(f"event_voxels must be [B,S,Cevt,H,W], got {event_voxels.shape}")
+            b_evt, s_evt, c_evt, h_evt, w_evt = event_voxels.shape
+            if b_evt != B or s_evt != S:
+                raise ValueError(f"event_voxels batch/sequence mismatch: rgb={(B,S)} event={(b_evt,s_evt)}")
+            assert h_evt == H and w_evt == W, (
+                f"Event/RGB size mismatch: rgb_hw=({H},{W}) event_hw=({h_evt},{w_evt}) patch={self.patch_size} tokenN={patch_tokens.shape[1]}"
+            )
+            event_voxels = event_voxels.reshape(B * S, c_evt, h_evt, w_evt)
+            event_tokens = self.event_patch_embed(event_voxels)
+            assert event_tokens.shape[1] == patch_tokens.shape[1], (
+                f"Token count mismatch: rgb={patch_tokens.shape} event={event_tokens.shape} H={H} W={W} patch={self.patch_size}"
+            )
+            if self.debug_fusion:
+                print(
+                    f"[FusionDebug] rgb_hw=({H},{W}) evt_hw=({h_evt},{w_evt}) cevt={c_evt} patch={self.patch_size} "
+                    f"X_rgb={tuple(patch_tokens.shape)} X_evt={tuple(event_tokens.shape)}"
+                )
+            patch_tokens = self.cross_attn_block(patch_tokens, event_tokens)
 
         _, P, C = patch_tokens.shape
 
