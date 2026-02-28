@@ -34,6 +34,12 @@ def parse_args():
     p.add_argument("--event_in_chans", type=int, default=8)
     p.add_argument("--max_frames", type=int, default=0, help="0 means all")
     p.add_argument(
+        "--chunk_size",
+        type=int,
+        default=0,
+        help="run inference in chunks to reduce peak GPU memory (0 = all frames at once)",
+    )
+    p.add_argument(
         "--allow_random_fusion_init",
         action="store_true",
         help="allow running when fusion params are missing in checkpoint (otherwise raise error)",
@@ -87,6 +93,32 @@ def _extract_state_dict(ckpt: Dict) -> Dict:
     return ckpt
 
 
+def _normalize_state_dict_for_model(state_dict: Dict[str, torch.Tensor], model: torch.nn.Module):
+    model_keys = set(model.state_dict().keys())
+
+    def _score(keys):
+        return len(set(keys) & model_keys)
+
+    candidates = {
+        "as_is": state_dict,
+        "strip_module": {k.replace("module.", "", 1): v for k, v in state_dict.items()},
+        "strip_model": {k.replace("model.", "", 1): v for k, v in state_dict.items()},
+        "strip_orig_mod": {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()},
+        "strip_module_orig_mod": {
+            k.replace("module.", "", 1).replace("_orig_mod.", "", 1): v for k, v in state_dict.items()
+        },
+    }
+
+    best_name, best_sd, best_score = None, None, -1
+    for name, sd in candidates.items():
+        score = _score(sd.keys())
+        if score > best_score:
+            best_name, best_sd, best_score = name, sd, score
+
+    print(f"[Load] key-normalize strategy={best_name}, matched_keys={best_score}/{len(model_keys)}")
+    return best_sd
+
+
 def _to_cpu(obj):
     if torch.is_tensor(obj):
         return obj.detach().cpu()
@@ -124,6 +156,23 @@ def _validate_loaded_keys(missing_keys: List[str], allow_random_fusion_init: boo
             "Checkpoint is missing fusion weights, so fused inference would use random-initialized fusion modules. "
             "Please use a checkpoint trained with fusion enabled, or pass --allow_random_fusion_init to override."
         )
+
+
+def _run_inference_in_chunks(model, frames: List[dict], chunk_size: int):
+    if chunk_size <= 0:
+        with torch.no_grad():
+            out = model.inference(frames)
+        return _to_cpu(out.ress)
+
+    all_results = []
+    for st in range(0, len(frames), chunk_size):
+        ed = min(st + chunk_size, len(frames))
+        with torch.no_grad():
+            out = model.inference(frames[st:ed])
+        all_results.extend(_to_cpu(out.ress))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return all_results
 
 
 def _save_png(arr: np.ndarray, path: Path):
@@ -187,7 +236,11 @@ def main():
     # Force fusion default path exactly as requested: fused_tokens replace rgb_tokens downstream.
     model = StreamVGGT(fusion="crossattn", event_in_chans=args.event_in_chans)
     ckpt = torch.load(args.weights, map_location="cpu")
-    load_msg = model.load_state_dict(_extract_state_dict(ckpt), strict=False)
+    state_dict = _extract_state_dict(ckpt)
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Unsupported checkpoint payload type: {type(state_dict)}")
+    state_dict = _normalize_state_dict_for_model(state_dict, model)
+    load_msg = model.load_state_dict(state_dict, strict=False)
     model = model.to(device).eval()
 
     print("[Load] missing_keys:", len(load_msg.missing_keys))
@@ -207,15 +260,14 @@ def main():
         for img, evt in pairs
     ]
 
-    with torch.no_grad():
-        out = model.inference(frames)
+    results_cpu = _run_inference_in_chunks(model, frames, args.chunk_size)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "results": _to_cpu(out.ress),
-            "num_frames": len(out.ress),
+            "results": results_cpu,
+            "num_frames": len(results_cpu),
             "resolution": [w, h],
             "weights": args.weights,
             "fusion": "crossattn",
@@ -223,11 +275,11 @@ def main():
         },
         output_path,
     )
-    print(f"Saved {len(out.ress)} frames to {output_path}")
+    print(f"Saved {len(results_cpu)} frames to {output_path}")
 
     if args.export_dir:
         _export_visualizations(
-            _to_cpu(out.ress),
+            results_cpu,
             Path(args.export_dir),
             save_rgb_png=args.save_rgb_png,
             save_depth_png=args.save_depth_png,
