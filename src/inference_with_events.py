@@ -28,10 +28,14 @@ def parse_args():
     p.add_argument("--image_dir", type=str, required=True, help="RGB image directory")
     p.add_argument("--event_dir", type=str, required=True, help="event voxel .pt directory")
     p.add_argument("--output", type=str, default="inference_with_events_out.pt", help="output .pt path")
+    p.add_argument("--export_dir", type=str, default="", help="optional directory to export visualized outputs")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--resolution", type=int, nargs=2, default=[518, 518], metavar=("W", "H"))
     p.add_argument("--event_in_chans", type=int, default=8)
     p.add_argument("--max_frames", type=int, default=0, help="0 means all")
+    p.add_argument("--save_rgb_png", action="store_true", help="export reconstructed RGB PNGs")
+    p.add_argument("--save_depth_png", action="store_true", help="export normalized depth PNGs")
+    p.add_argument("--save_ply", action="store_true", help="export point clouds as PLY (requires open3d)")
     return p.parse_args()
 
 
@@ -88,6 +92,60 @@ def _to_cpu(obj):
     return obj
 
 
+def _save_png(arr: np.ndarray, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(arr).save(path)
+
+
+def _export_visualizations(results: List[dict], export_dir: Path, save_rgb_png: bool, save_depth_png: bool, save_ply: bool):
+    export_dir.mkdir(parents=True, exist_ok=True)
+    ply_enabled = save_ply
+    o3d = None
+    if save_ply:
+        try:
+            import open3d as o3d_module
+
+            o3d = o3d_module
+        except Exception as exc:  # optional dependency
+            print(f"[Warn] open3d unavailable, skipping PLY export: {exc}")
+            ply_enabled = False
+
+    for i, res in enumerate(results):
+        if save_rgb_png and "rgb" in res:
+            rgb = res["rgb"]
+            if torch.is_tensor(rgb):
+                rgb = rgb.squeeze(0).numpy()
+            rgb = np.clip(rgb, 0.0, 1.0)
+            _save_png((rgb * 255.0).astype(np.uint8), export_dir / "rgb" / f"{i:05d}.png")
+
+        if save_depth_png and "depth" in res:
+            depth = res["depth"]
+            if torch.is_tensor(depth):
+                depth = depth.squeeze(0).numpy()
+            depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+            dmin, dmax = float(depth.min()), float(depth.max())
+            if dmax > dmin:
+                depth = (depth - dmin) / (dmax - dmin)
+            else:
+                depth = np.zeros_like(depth)
+            _save_png((depth * 255.0).astype(np.uint8), export_dir / "depth" / f"{i:05d}.png")
+
+        if ply_enabled and "pts3d_in_other_view" in res and "rgb" in res:
+            pts = res["pts3d_in_other_view"]
+            rgb = res["rgb"]
+            if torch.is_tensor(pts):
+                pts = pts.squeeze(0).reshape(-1, 3).numpy()
+            if torch.is_tensor(rgb):
+                rgb = rgb.squeeze(0).reshape(-1, 3).numpy()
+            valid = np.isfinite(pts).all(axis=1)
+            if valid.any():
+                (export_dir / "ply").mkdir(parents=True, exist_ok=True)
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(pts[valid])
+                pcd.colors = o3d.utility.Vector3dVector(np.clip(rgb[valid], 0.0, 1.0))
+                o3d.io.write_point_cloud(str(export_dir / "ply" / f"{i:05d}.ply"), pcd)
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -131,6 +189,16 @@ def main():
         output_path,
     )
     print(f"Saved {len(out.ress)} frames to {output_path}")
+
+    if args.export_dir:
+        _export_visualizations(
+            _to_cpu(out.ress),
+            Path(args.export_dir),
+            save_rgb_png=args.save_rgb_png,
+            save_depth_png=args.save_depth_png,
+            save_ply=args.save_ply,
+        )
+        print(f"Exported visualization assets to {args.export_dir}")
 
 
 if __name__ == "__main__":
