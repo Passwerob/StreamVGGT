@@ -33,6 +33,11 @@ def parse_args():
     p.add_argument("--resolution", type=int, nargs=2, default=[518, 518], metavar=("W", "H"))
     p.add_argument("--event_in_chans", type=int, default=8)
     p.add_argument("--max_frames", type=int, default=0, help="0 means all")
+    p.add_argument(
+        "--allow_random_fusion_init",
+        action="store_true",
+        help="allow running when fusion params are missing in checkpoint (otherwise raise error)",
+    )
     p.add_argument("--save_rgb_png", action="store_true", help="export reconstructed RGB PNGs")
     p.add_argument("--save_depth_png", action="store_true", help="export normalized depth PNGs")
     p.add_argument("--save_ply", action="store_true", help="export point clouds as PLY (requires open3d)")
@@ -90,6 +95,35 @@ def _to_cpu(obj):
     if isinstance(obj, list):
         return [_to_cpu(v) for v in obj]
     return obj
+
+
+def _validate_loaded_keys(missing_keys: List[str], allow_random_fusion_init: bool):
+    fusion_prefixes = ("aggregator.event_patch_embed.", "aggregator.cross_attn_block.")
+    fusion_missing = [k for k in missing_keys if k.startswith(fusion_prefixes)]
+    mae_missing = [k for k in missing_keys if k.startswith("mae_pred_head.")]
+    recon_missing = [k for k in missing_keys if k.startswith("rgb_recon_head.")]
+    other_missing = [k for k in missing_keys if k not in set(fusion_missing + mae_missing + recon_missing)]
+
+    if missing_keys:
+        print("[Load] missing key details:")
+        if fusion_missing:
+            print(f"  - fusion_missing ({len(fusion_missing)}):")
+            for k in fusion_missing:
+                print(f"      {k}")
+        if mae_missing:
+            print(f"  - mae_missing ({len(mae_missing)}): {mae_missing}")
+        if recon_missing:
+            print(f"  - rgb_recon_missing ({len(recon_missing)}): {recon_missing}")
+        if other_missing:
+            print(f"  - other_missing ({len(other_missing)}):")
+            for k in other_missing:
+                print(f"      {k}")
+
+    if fusion_missing and not allow_random_fusion_init:
+        raise RuntimeError(
+            "Checkpoint is missing fusion weights, so fused inference would use random-initialized fusion modules. "
+            "Please use a checkpoint trained with fusion enabled, or pass --allow_random_fusion_init to override."
+        )
 
 
 def _save_png(arr: np.ndarray, path: Path):
@@ -158,6 +192,7 @@ def main():
 
     print("[Load] missing_keys:", len(load_msg.missing_keys))
     print("[Load] unexpected_keys:", len(load_msg.unexpected_keys))
+    _validate_loaded_keys(load_msg.missing_keys, args.allow_random_fusion_init)
 
     pairs = _collect_pairs(Path(args.image_dir), Path(args.event_dir))
     if args.max_frames > 0:
