@@ -175,7 +175,12 @@ def train(args):
 
     # model
     printer.info("Loading model")
-    model = StreamVGGT()
+    model = StreamVGGT(
+        fusion=args.fusion,
+        event_in_chans=args.event_in_chans,
+        fusion_heads=args.fusion_heads,
+        freeze_backbone=args.freeze_backbone,
+    )
     teacher = VGGT()
 
     # model: PreTrainedModel = eval(args.model)

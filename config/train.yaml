@@ -78,6 +78,11 @@ min_lr: 1e-7
 warmup_epochs: 0.5
 amp: 1
 
+fusion: none
+event_in_chans: 8
+fusion_heads: 8
+freeze_backbone: False
+
 num_workers: 12
 world_size: 1
 local-rank: -1

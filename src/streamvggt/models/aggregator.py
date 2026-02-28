@@ -14,6 +14,7 @@ from streamvggt.layers import PatchEmbed
 from streamvggt.layers.block import Block
 from streamvggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from streamvggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from streamvggt.models.fusion import EventPatchEmbed, EventProj, CrossAttnFuse
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,9 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        fusion="none",
+        event_in_chans=8,
+        fusion_heads=8,
     ):
         super().__init__()
 
@@ -112,7 +116,19 @@ class Aggregator(nn.Module):
         self.depth = depth
         self.aa_order = aa_order
         self.patch_size = patch_size
+        if fusion not in {"none", "crossattn"}:
+            raise ValueError(f"Unsupported fusion mode: {fusion}")
+        self.fusion = fusion
+        self._fusion_debug_printed = False
         self.aa_block_size = aa_block_size
+
+        self.event_patch_embed = EventPatchEmbed(
+            in_chans=event_in_chans,
+            embed_dim=embed_dim,
+            patch_size=patch_size,
+        )
+        self.event_proj = EventProj(dim_in=embed_dim, dim_out=embed_dim)
+        self.cross_attn_fuse = CrossAttnFuse(dim=embed_dim, num_heads=fusion_heads)
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -188,6 +204,7 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        event_voxels: Optional[torch.Tensor] = None,
         past_key_values=None,
         use_cache=False,
         past_frame_idx=0
@@ -225,6 +242,42 @@ class Aggregator(nn.Module):
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
+
+        if self.fusion == "crossattn":
+            if event_voxels is None:
+                raise ValueError("fusion='crossattn' requires event_voxels in shape [B, S, Cevt, H, W].")
+            if event_voxels.shape[0] != B or event_voxels.shape[1] != S:
+                raise ValueError(
+                    f"Expected event_voxels batch/seq ({B}, {S}), got ({event_voxels.shape[0]}, {event_voxels.shape[1]})."
+                )
+
+            event_h, event_w = event_voxels.shape[-2], event_voxels.shape[-1]
+            if event_h != H or event_w != W:
+                raise ValueError(f"Expected event voxel size {(H, W)}, got {(event_h, event_w)}")
+
+            event_tokens = self.event_patch_embed(event_voxels.reshape(B * S, event_voxels.shape[2], H, W))
+            event_tokens = self.event_proj(event_tokens)
+
+            n_rgb = patch_tokens.shape[1]
+            n_evt = event_tokens.shape[1]
+            if n_rgb != n_evt:
+                rgb_ph, rgb_pw = H // self.patch_size, W // self.patch_size
+                evt_ph, evt_pw = event_h // self.patch_size, event_w // self.patch_size
+                raise AssertionError(
+                    "Patch token count mismatch. "
+                    f"rgb H,W=({H},{W}) patch_size={self.patch_size} N_rgb={n_rgb} (grid={rgb_ph}x{rgb_pw}); "
+                    f"event H,W=({event_h},{event_w}) patch_size={self.patch_size} N_evt={n_evt} (grid={evt_ph}x{evt_pw})"
+                )
+
+            fused_tokens = self.cross_attn_fuse(patch_tokens, event_tokens)
+            patch_tokens = fused_tokens
+
+            if not self._fusion_debug_printed:
+                print(
+                    f"[Aggregator] Using fused tokens for downstream heads: fusion={self.fusion}, "
+                    f"shape={tuple(patch_tokens.shape)}, gate={self.cross_attn_fuse.gate.item():.6f}"
+                )
+                self._fusion_debug_printed = True
 
         _, P, C = patch_tokens.shape
 

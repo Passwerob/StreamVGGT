@@ -16,10 +16,29 @@ class StreamVGGTOutput(ModelOutput):
     views: Optional[torch.Tensor] = None
 
 class StreamVGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024):
+    def __init__(
+        self,
+        img_size=518,
+        patch_size=14,
+        embed_dim=1024,
+        fusion="none",
+        event_in_chans=8,
+        fusion_heads=8,
+        freeze_backbone=False,
+    ):
         super().__init__()
 
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        self.fusion = fusion
+        self.freeze_backbone = freeze_backbone
+
+        self.aggregator = Aggregator(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            fusion=fusion,
+            event_in_chans=event_in_chans,
+            fusion_heads=fusion_heads,
+        )
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
@@ -49,7 +68,19 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         if history_info is None:
             history_info = {"token": None}
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        event_voxels = None
+        event_key = None
+        if isinstance(views, (list, tuple)) and len(views) > 0:
+            if "event_voxel" in views[0]:
+                event_key = "event_voxel"
+            elif "event" in views[0]:
+                event_key = "event"
+        if event_key is not None:
+            event_voxels = torch.stack([view[event_key] for view in views], dim=0).permute(1, 0, 2, 3, 4)
+            if len(event_voxels.shape) == 4:
+                event_voxels = event_voxels.unsqueeze(0)
+
+        aggregated_tokens_list, patch_start_idx = self.aggregator(images, event_voxels=event_voxels)
         predictions = {}
 
         with torch.cuda.amp.autocast(enabled=False):
@@ -113,6 +144,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             images = frame["img"].unsqueeze(0) 
             aggregator_output = self.aggregator(
                 images, 
+                event_voxels=(
+                    frame["event_voxel"].unsqueeze(0) if "event_voxel" in frame
+                    else frame["event"].unsqueeze(0) if "event" in frame
+                    else None
+                ),
                 past_key_values=past_key_values,
                 use_cache=True, 
                 past_frame_idx=i
