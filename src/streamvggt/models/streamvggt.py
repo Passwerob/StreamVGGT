@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import logging
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from streamvggt.models.aggregator import Aggregator
@@ -9,6 +10,8 @@ from streamvggt.heads.track_head import TrackHead
 from transformers.file_utils import ModelOutput
 from typing import Optional, Tuple, List, Any
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class StreamVGGTOutput(ModelOutput):
@@ -195,3 +198,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
     def freeze_backbone(self):
         self.aggregator.freeze_backbone()
+
+    def gradient_checkpointing_enable(self):
+        if hasattr(self.aggregator, "patch_embed") and hasattr(self.aggregator.patch_embed, "use_checkpoint"):
+            self.aggregator.patch_embed.use_checkpoint = True
+            logger.info("Enabled gradient checkpointing for patch_embed")
+        else:
+            logger.warning("gradient_checkpointing_enable requested, but patch_embed has no use_checkpoint flag")
+
+    def gradient_checkpointing_disable(self):
+        if hasattr(self.aggregator, "patch_embed") and hasattr(self.aggregator.patch_embed, "use_checkpoint"):
+            self.aggregator.patch_embed.use_checkpoint = False

@@ -208,7 +208,10 @@ def train(args):
     model.to(device)
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        else:
+            printer.warning("gradient_checkpointing=True ignored: model has no gradient_checkpointing_enable()")
     if args.long_context:
         model.fixed_input_length = False
 
