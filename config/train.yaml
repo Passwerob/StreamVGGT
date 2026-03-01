@@ -1,5 +1,6 @@
 teacher: ../ckpt/model.pt
 pretrained: ../ckpt/model.pt
+pretrained_strict: True
 dataset: default
 data_root: /data/fcr/data/rgv_interval_final/raw_data
 fixed_frames: 49

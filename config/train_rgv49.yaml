@@ -1,0 +1,16 @@
+defaults:
+  - train
+  - _self_
+
+dataset: rgv49
+data_root: /data/fcr/data/rgv_interval_final/raw_data
+fixed_frames: 49
+split: all
+resolution: [518, 392]
+
+fusion: crossattn
+event_in_chans: 8
+freeze_backbone: True
+only_rgb_loss: True
+rgb_loss: mse
+pretrained_strict: False

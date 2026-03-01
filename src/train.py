@@ -215,9 +215,26 @@ def train(args):
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
-        printer.info(
-            model.load_state_dict(ckpt, strict=True)
-        )
+
+        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        if isinstance(state_dict, dict):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+        strict_load = bool(args.pretrained_strict)
+        if args.fusion == "crossattn":
+            strict_load = False
+
+        load_msg = model.load_state_dict(state_dict, strict=strict_load)
+        printer.info(f"Pretrained load (strict={strict_load}): {load_msg}")
+
+        if args.fusion == "crossattn" and load_msg.missing_keys:
+            non_fusion_missing = [k for k in load_msg.missing_keys if not k.startswith("aggregator.event_") and not k.startswith("aggregator.cross_attn_fuse")]
+            if non_fusion_missing:
+                raise RuntimeError(
+                    "Unexpected missing non-fusion keys when loading pretrained checkpoint: "
+                    + ", ".join(non_fusion_missing[:20])
+                )
+
         del ckpt  # in case it occupies memory
 
     for _, param in model.named_parameters():

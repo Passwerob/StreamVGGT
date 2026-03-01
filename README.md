@@ -207,3 +207,15 @@ python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/ra
 ```bash
 python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/raw_data fixed_frames=49 split=all fusion=crossattn freeze_backbone=True event_in_chans=8 only_rgb_loss=True
 ```
+
+If your pretrained checkpoint was trained before fusion modules existed, load with non-strict mode:
+
+```bash
+python src/train.py --config-name train_rgv49
+```
+
+or explicitly:
+
+```bash
+python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/raw_data fixed_frames=49 split=all fusion=crossattn freeze_backbone=True event_in_chans=8 only_rgb_loss=True pretrained_strict=False
+```
