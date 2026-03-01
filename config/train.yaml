@@ -12,6 +12,13 @@ n_corres_test: 0
 
 train_criterion: DistillLoss()
 test_criterion: DistillLoss()
+fusion: crossattn
+event_in_chans: 8
+fusion_heads: 8
+freeze_backbone: True
+rgb_loss: mse
+only_rgb_loss: True
+debug_fusion: False
 allow_repeat: False
 
 dataset1: Co3d_Multi(allow_repeat=${allow_repeat}, split='train', ROOT='../data/train/processed_co3d/', 

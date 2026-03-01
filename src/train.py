@@ -33,7 +33,7 @@ from dust3r.model import (
 )  # noqa: F401, needed when loading the model
 from dust3r.datasets import get_data_loader
 from dust3r.losses import *  # noqa: F401, needed when loading the model
-from dust3r.inference import loss_of_one_batch  # noqa
+from dust3r.inference import loss_of_one_batch, sample_query_points  # noqa
 from dust3r.viz import colorize
 from dust3r.utils.render import get_render_results
 import dust3r.utils.path_to_croco  # noqa: F401
@@ -55,7 +55,6 @@ from accelerate.logging import get_logger
 from datetime import timedelta
 import torch.multiprocessing
 
-from vggt.models.vggt import VGGT
 from streamvggt.models.streamvggt import StreamVGGT
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -175,19 +174,21 @@ def train(args):
 
     # model
     printer.info("Loading model")
-    model = StreamVGGT()
-    teacher = VGGT()
+    model = StreamVGGT(
+        fusion=args.fusion,
+        event_in_chans=args.event_in_chans,
+        fusion_heads=args.fusion_heads,
+        debug_fusion=args.debug_fusion,
+    )
+    teacher = None
 
     # model: PreTrainedModel = eval(args.model)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
 
 
     printer.info(f">> Creating train criterion = {args.train_criterion}")
-    train_criterion = eval(args.train_criterion).to(device)
-    printer.info(
-        f">> Creating test criterion = {args.test_criterion or args.train_criterion}"
-    )
-    test_criterion = eval(args.test_criterion or args.criterion).to(device)
+    train_criterion = eval(args.train_criterion).to(device) if not args.only_rgb_loss else None
+    test_criterion = train_criterion
 
     model.to(device)
 
@@ -204,51 +205,15 @@ def train(args):
         )
         del ckpt  # in case it occupies memory
 
-    printer.info("Loading teacher model")
-    ckpt_teacher = torch.load(args.pretrained, map_location=device)
-    teacher.load_state_dict(ckpt_teacher, strict=True)
-    teacher = teacher.to("cuda")
-    for p in teacher.parameters():
-        p.requires_grad = False  
-    teacher.eval()
-    del ckpt_teacher
-
-
-    # freeze
-    printer.info("Freezing patch embedding and positional encoding parameters...")
-    frozen_params = 0
-    total_params = 0
-
-    frozen_param_names = []
-
-    for name, param in model.named_parameters():
-        total_params += param.numel()
+    for _, param in model.named_parameters():
         param.requires_grad = True
+    if args.freeze_backbone:
+        model.freeze_backbone()
 
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'patch_embed'):
-        for param in model.aggregator.patch_embed.parameters():
-            if param.requires_grad:
-                param.requires_grad = False
-
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'camera_token'):
-        model.aggregator.camera_token.requires_grad = False
-
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'register_token'):
-        model.aggregator.register_token.requires_grad = False
-
-
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            frozen_params += p.numel()
-            frozen_param_names.append(name)
-
-    printer.info(
-        f"Frozen {frozen_params:,} parameters out of {total_params:,} total parameters. ({frozen_params / total_params:.2%})")
-    printer.info(
-        f"Trainable parameters: {total_params - frozen_params:,} ({(total_params - frozen_params) / total_params:.2%})")
-    if frozen_param_names:
-        printer.info(
-            f"Example frozen parameters: {', '.join(frozen_param_names[:5])}{'...' if len(frozen_param_names) > 5 else ''}")
+    backbone_trainable = sum(p.numel() for p in model.aggregator.patch_embed.parameters() if p.requires_grad)
+    fusion_heads_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) - backbone_trainable
+    printer.info(f"backbone trainable params = {backbone_trainable}")
+    printer.info(f"fusion+heads trainable params = {fusion_heads_trainable}")
 
 
 
@@ -459,18 +424,28 @@ def train_one_epoch(
             epoch_f = epoch + data_iter_step / len(data_loader)
             step = int(epoch_f * len(data_loader))
 
-            result = loss_of_one_batch(
-                batch,
-                model,
-                criterion,
-                accelerator,
-                teacher=teacher,
-                inference=False,
-                symmetrize_batch=False,
-                use_amp=bool(args.amp),
-            )
-      
-            loss, loss_details = result["loss"]  # criterion returns two values
+            if args.only_rgb_loss:
+                query_pts = None
+                if "valid_mask" in batch[0]:
+                    query_pts = sample_query_points(batch[0]['valid_mask'], M=64).to(device=batch[0]["img"].device)
+                output = model(batch, query_pts)
+                preds = output.ress
+                pred_rgb = torch.stack([pred["rgb"] for pred in preds], dim=1)
+                rgb_gt = torch.stack([view["img"].permute(0, 2, 3, 1) for view in batch], dim=1)
+                loss = F.mse_loss(pred_rgb, rgb_gt)
+                loss_details = {"loss_rgb": float(loss)}
+            else:
+                result = loss_of_one_batch(
+                    batch,
+                    model,
+                    criterion,
+                    accelerator,
+                    teacher=teacher,
+                    inference=False,
+                    symmetrize_batch=False,
+                    use_amp=bool(args.amp),
+                )
+                loss, loss_details = result["loss"]  # criterion returns two values
 
             loss_value = float(loss)
 
@@ -479,7 +454,8 @@ def train_one_epoch(
                     f"Loss is {loss_value}, stopping training, loss details: {loss_details}"
                 )
                 sys.exit(1)
-            if not result.get("already_backprop", False):
+            already_backprop = result.get("already_backprop", False) if not args.only_rgb_loss else False
+            if not already_backprop:
                 loss_scaler(
                     loss,
                     optimizer,
