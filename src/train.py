@@ -529,14 +529,22 @@ def train_one_epoch(
             if args.only_rgb_loss:
                 if args.dataset == "rgv49" and getattr(args, "rgv_framewise_train", True):
                     T = rgb_seq.shape[1]
-                    loss = 0.0
+                    loss = torch.zeros((), device=rgb_seq.device)
                     for t in range(T):
                         frame_batch = [{"img": rgb_seq[:, t], "event_voxel": event_seq[:, t], "is_metric": False}]
                         output = model(frame_batch, None)
                         pred_rgb = output.ress[0]["rgb"]
                         rgb_gt = rgb_seq[:, t].permute(0, 2, 3, 1)
-                        loss = loss + F.mse_loss(pred_rgb, rgb_gt)
+                        frame_loss = F.mse_loss(pred_rgb, rgb_gt)
+                        loss = loss + frame_loss.detach()
+                        accelerator.backward(frame_loss / T)
+
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
                     loss = loss / T
+                    already_backprop = True
                     batch = [{"is_metric": False}]
                 else:
                     query_pts = None
@@ -547,6 +555,7 @@ def train_one_epoch(
                     pred_rgb = torch.stack([pred["rgb"] for pred in preds], dim=1)
                     rgb_gt = torch.stack([view["img"].permute(0, 2, 3, 1) for view in batch], dim=1)
                     loss = F.mse_loss(pred_rgb, rgb_gt)
+                    already_backprop = False
                 loss_details = {"loss_rgb": float(loss)}
             else:
                 result = loss_of_one_batch(
@@ -560,6 +569,7 @@ def train_one_epoch(
                     use_amp=bool(args.amp),
                 )
                 loss, loss_details = result["loss"]  # criterion returns two values
+                already_backprop = result.get("already_backprop", False)
 
             loss_value = float(loss)
 
@@ -568,7 +578,6 @@ def train_one_epoch(
                     f"Loss is {loss_value}, stopping training, loss details: {loss_details}"
                 )
                 sys.exit(1)
-            already_backprop = result.get("already_backprop", False) if not args.only_rgb_loss else False
             if not already_backprop:
                 loss_scaler(
                     loss,
