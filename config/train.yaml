@@ -18,12 +18,12 @@ n_corres_test: 0
 
 train_criterion: DistillLoss()
 test_criterion: DistillLoss()
-fusion: crossattn
+fusion: none
 event_in_chans: 8
 fusion_heads: 8
 freeze_backbone: True
 rgb_loss: mse
-only_rgb_loss: True
+only_rgb_loss: False
 debug_fusion: False
 rgv_framewise_train: True
 quiet_pil: True

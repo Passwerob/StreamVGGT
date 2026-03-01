@@ -58,6 +58,7 @@ import torch.multiprocessing
 
 from streamvggt.models.streamvggt import StreamVGGT
 from streamvggt.data.rgv_interval49 import RGVIntervalFixed49Dataset
+from vggt.models.vggt import VGGT
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -201,6 +202,10 @@ def train(args):
     )
     teacher = None
 
+    if args.fusion == "crossattn" and args.dataset != "rgv49":
+        printer.warning("fusion=crossattn but dataset has no event_voxel by default; fallback to fusion=none")
+        model.aggregator.fusion = "none"
+
     # model: PreTrainedModel = eval(args.model)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
 
@@ -243,6 +248,22 @@ def train(args):
                 )
 
         del ckpt  # in case it occupies memory
+
+    if not args.only_rgb_loss:
+        teacher = VGGT().to(device)
+        teacher_ckpt_path = args.teacher if getattr(args, "teacher", None) else args.pretrained
+        if teacher_ckpt_path is None:
+            raise ValueError("only_rgb_loss=False requires teacher checkpoint (set teacher or pretrained)")
+        printer.info(f"Loading teacher model from: {teacher_ckpt_path}")
+        teacher_ckpt = torch.load(teacher_ckpt_path, map_location=device)
+        teacher_state = teacher_ckpt["model"] if isinstance(teacher_ckpt, dict) and "model" in teacher_ckpt else teacher_ckpt
+        if isinstance(teacher_state, dict):
+            teacher_state = {k.replace("module.", "", 1): v for k, v in teacher_state.items()}
+        teacher.load_state_dict(teacher_state, strict=True)
+        for p in teacher.parameters():
+            p.requires_grad = False
+        teacher.eval()
+        del teacher_ckpt
 
     for _, param in model.named_parameters():
         param.requires_grad = True
