@@ -25,6 +25,8 @@ freeze_backbone: True
 rgb_loss: mse
 only_rgb_loss: True
 debug_fusion: False
+rgv_framewise_train: True
+quiet_pil: True
 allow_repeat: False
 
 dataset1: Co3d_Multi(allow_repeat=${allow_repeat}, split='train', ROOT='../data/train/processed_co3d/', 

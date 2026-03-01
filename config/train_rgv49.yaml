@@ -14,3 +14,5 @@ freeze_backbone: True
 only_rgb_loss: True
 rgb_loss: mse
 pretrained_strict: False
+rgv_framewise_train: True
+quiet_pil: True

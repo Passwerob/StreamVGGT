@@ -113,6 +113,10 @@ def save_current_code(outdir):
 
 def train(args):
 
+    if getattr(args, "quiet_pil", True):
+        logging.getLogger("PIL").setLevel(logging.WARNING)
+        logging.getLogger("PIL.PngImagePlugin").setLevel(logging.WARNING)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.accum_iter,
         mixed_precision="bf16",
@@ -462,6 +466,8 @@ def train_one_epoch(
 
     for data_iter_step, batch in enumerate(data_iter):
 
+        rgb_seq = None
+        event_seq = None
         if args.dataset == "rgv49":
             rgb_seq = batch["rgb"]  # [B,T,3,H,W], normalized to [-1,1]
             event_seq = batch["event"]  # [B,T,C,H,W]
@@ -469,15 +475,16 @@ def train_one_epoch(
                 raise RuntimeError(
                     f"RGV49 fixed frame count mismatch: rgb_T={rgb_seq.shape[1]}, event_T={event_seq.shape[1]}"
                 )
-            T = rgb_seq.shape[1]
-            batch = [
-                {
-                    "img": rgb_seq[:, t],
-                    "event_voxel": event_seq[:, t],
-                    "is_metric": False,
-                }
-                for t in range(T)
-            ]
+            if not getattr(args, "rgv_framewise_train", True):
+                T = rgb_seq.shape[1]
+                batch = [
+                    {
+                        "img": rgb_seq[:, t],
+                        "event_voxel": event_seq[:, t],
+                        "is_metric": False,
+                    }
+                    for t in range(T)
+                ]
             
         with accelerator.accumulate(model):
             # change the range of the image to [0, 1]
@@ -486,6 +493,9 @@ def train_one_epoch(
             elif isinstance(batch, list) and all(isinstance(v, dict) and "img" in v for v in batch):
                 for view in batch:
                     view["img"] = (view["img"] + 1.0) / 2.0
+
+            if args.dataset == "rgv49" and getattr(args, "rgv_framewise_train", True):
+                rgb_seq = (rgb_seq + 1.0) / 2.0
 
             epoch_f = epoch + data_iter_step / len(data_loader)
             # we use a per iteration (instead of per epoch) lr scheduler
@@ -496,14 +506,26 @@ def train_one_epoch(
             step = int(epoch_f * len(data_loader))
 
             if args.only_rgb_loss:
-                query_pts = None
-                if "valid_mask" in batch[0]:
-                    query_pts = sample_query_points(batch[0]['valid_mask'], M=64).to(device=batch[0]["img"].device)
-                output = model(batch, query_pts)
-                preds = output.ress
-                pred_rgb = torch.stack([pred["rgb"] for pred in preds], dim=1)
-                rgb_gt = torch.stack([view["img"].permute(0, 2, 3, 1) for view in batch], dim=1)
-                loss = F.mse_loss(pred_rgb, rgb_gt)
+                if args.dataset == "rgv49" and getattr(args, "rgv_framewise_train", True):
+                    T = rgb_seq.shape[1]
+                    loss = 0.0
+                    for t in range(T):
+                        frame_batch = [{"img": rgb_seq[:, t], "event_voxel": event_seq[:, t], "is_metric": False}]
+                        output = model(frame_batch, None)
+                        pred_rgb = output.ress[0]["rgb"]
+                        rgb_gt = rgb_seq[:, t].permute(0, 2, 3, 1)
+                        loss = loss + F.mse_loss(pred_rgb, rgb_gt)
+                    loss = loss / T
+                    batch = [{"is_metric": False}]
+                else:
+                    query_pts = None
+                    if "valid_mask" in batch[0]:
+                        query_pts = sample_query_points(batch[0]['valid_mask'], M=64).to(device=batch[0]["img"].device)
+                    output = model(batch, query_pts)
+                    preds = output.ress
+                    pred_rgb = torch.stack([pred["rgb"] for pred in preds], dim=1)
+                    rgb_gt = torch.stack([view["img"].permute(0, 2, 3, 1) for view in batch], dim=1)
+                    loss = F.mse_loss(pred_rgb, rgb_gt)
                 loss_details = {"loss_rgb": float(loss)}
             else:
                 result = loss_of_one_batch(
