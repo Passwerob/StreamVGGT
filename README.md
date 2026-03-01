@@ -196,3 +196,14 @@ If you find this project helpful, please consider citing the following paper:
       year={2025}
 }
 ```
+
+## RGV fixed-49 RGB+Event training
+Use the fixed-length RGV dataset loader (`dataset=rgv49`) with strict 49-frame alignment.
+
+```bash
+python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/raw_data fixed_frames=49 split=all fusion=none freeze_backbone=True only_rgb_loss=True
+```
+
+```bash
+python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/raw_data fixed_frames=49 split=all fusion=crossattn freeze_backbone=True event_in_chans=8 only_rgb_loss=True
+```

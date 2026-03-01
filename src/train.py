@@ -21,6 +21,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
@@ -56,6 +57,7 @@ from datetime import timedelta
 import torch.multiprocessing
 
 from streamvggt.models.streamvggt import StreamVGGT
+from streamvggt.data.rgv_interval49 import RGVIntervalFixed49Dataset
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -149,28 +151,41 @@ def train(args):
     cudnn.benchmark = args.benchmark
 
     # training dataset and loader
-    printer.info("Building train dataset %s", args.train_dataset)
-    #  dataset and loader
-    data_loader_train = build_dataset(
-        args.train_dataset,
-        args.batch_size,
-        args.num_workers,
-        accelerator=accelerator,
-        test=False,
-        fixed_length=args.fixed_length
-    )
-    printer.info("Building test dataset %s", args.test_dataset)
-    data_loader_test = {
-        dataset.split("(")[0]: build_dataset(
-            dataset,
+    if args.dataset == "rgv49":
+        printer.info("Building train dataset rgv49 from %s", args.data_root)
+        data_loader_train = build_dataset(
+            args.train_dataset,
             args.batch_size,
             args.num_workers,
             accelerator=accelerator,
-            test=True,
-            fixed_length=True
+            test=False,
+            fixed_length=True,
+            args=args,
         )
-        for dataset in args.test_dataset.split("+")
-    }
+        data_loader_test = {}
+    else:
+        printer.info("Building train dataset %s", args.train_dataset)
+        data_loader_train = build_dataset(
+            args.train_dataset,
+            args.batch_size,
+            args.num_workers,
+            accelerator=accelerator,
+            test=False,
+            fixed_length=args.fixed_length
+        )
+        printer.info("Building test dataset %s", args.test_dataset)
+        data_loader_test = {
+            dataset.split("(")[0]: build_dataset(
+                dataset,
+                args.batch_size,
+                args.num_workers,
+                accelerator=accelerator,
+                test=True,
+                fixed_length=True,
+                args=args,
+            )
+            for dataset in args.test_dataset.split("+")
+        }
 
     # model
     printer.info("Loading model")
@@ -337,7 +352,26 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=No
     misc.save_on_master(accelerator, to_save, checkpoint_path)
 
 
-def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False):
+def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False, args=None):
+    if args is not None and args.dataset == "rgv49":
+        if args.fixed_frames != 49:
+            raise ValueError(f"--fixed_frames must be 49 for rgv49 dataset, got {args.fixed_frames}")
+        dataset_obj = RGVIntervalFixed49Dataset(
+            data_root=args.data_root,
+            split=args.split,
+            fixed_frames=args.fixed_frames,
+            event_in_chans=args.event_in_chans,
+            resolution=tuple(args.resolution) if args.resolution is not None else None,
+        )
+        return DataLoader(
+            dataset_obj,
+            batch_size=batch_size,
+            shuffle=not test,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=not test,
+        )
+
     split = ["Train", "Test"][test]
     printer.info(f"Building {split} Data loader for dataset: {dataset}")
     loader = get_data_loader(
@@ -407,6 +441,23 @@ def train_one_epoch(
     data_iter = metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
 
     for data_iter_step, batch in enumerate(data_iter):
+
+        if args.dataset == "rgv49":
+            rgb_seq = batch["rgb"]  # [B,T,3,H,W], normalized to [-1,1]
+            event_seq = batch["event"]  # [B,T,C,H,W]
+            if rgb_seq.shape[1] != 49 or event_seq.shape[1] != 49:
+                raise RuntimeError(
+                    f"RGV49 fixed frame count mismatch: rgb_T={rgb_seq.shape[1]}, event_T={event_seq.shape[1]}"
+                )
+            T = rgb_seq.shape[1]
+            batch = [
+                {
+                    "img": rgb_seq[:, t],
+                    "event_voxel": event_seq[:, t],
+                    "is_metric": False,
+                }
+                for t in range(T)
+            ]
             
         with accelerator.accumulate(model):
             # change the range of the image to [0, 1]
@@ -465,7 +516,7 @@ def train_one_epoch(
                 )
                 optimizer.zero_grad()
 
-            is_metric = batch[0]["is_metric"]
+            is_metric = batch[0].get("is_metric", False)
             curr_num_view = len(batch)
 
             del loss
