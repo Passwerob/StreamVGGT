@@ -5,6 +5,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 import torchvision.transforms as tvf
+import torch.nn.functional as F
 
 ImgNorm = tvf.Compose([tvf.ToTensor(), tvf.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
@@ -109,9 +110,12 @@ class RGVIntervalFixed49Dataset(Dataset):
 
         h, w = out_hw
         if evt.shape[-2:] != (h, w):
-            raise RuntimeError(
-                f"Event/image resolution mismatch at {path}: event_hw={evt.shape[-2:]}, image_hw={(h, w)}"
-            )
+            evt = F.interpolate(
+                evt.unsqueeze(0),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
 
         return evt
 
