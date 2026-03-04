@@ -14,6 +14,7 @@ from streamvggt.layers import PatchEmbed
 from streamvggt.layers.block import Block
 from streamvggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from streamvggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from streamvggt.models.fusion import EventPatchEmbed, EventProj, CrossAttnFuse
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,10 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        fusion="none",
+        event_in_chans=8,
+        fusion_heads=8,
+        debug_fusion=False,
     ):
         super().__init__()
 
@@ -113,6 +118,18 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self.fusion = fusion
+        self.debug_fusion = debug_fusion
+        self._debug_print_count = 0
+
+        if fusion == "crossattn":
+            self.event_patch_embed = EventPatchEmbed(in_chans=event_in_chans, embed_dim=embed_dim, patch_size=patch_size)
+            self.event_proj = EventProj(in_dim=embed_dim, out_dim=embed_dim)
+            self.cross_attn_fuse = CrossAttnFuse(dim=embed_dim, num_heads=fusion_heads)
+        else:
+            self.event_patch_embed = None
+            self.event_proj = None
+            self.cross_attn_fuse = None
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -188,6 +205,7 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        event_voxel: Optional[torch.Tensor] = None,
         past_key_values=None,
         use_cache=False,
         past_frame_idx=0
@@ -225,6 +243,29 @@ class Aggregator(nn.Module):
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
+
+        rgb_tokens = patch_tokens
+        if self.fusion == "crossattn":
+            if event_voxel is None:
+                raise ValueError("fusion='crossattn' requires event_voxel input")
+            evt = event_voxel.reshape(B * S, event_voxel.shape[2], H, W)
+            event_tokens = self.event_patch_embed(evt)
+            event_kv = self.event_proj(event_tokens)
+            patch_tokens = self.cross_attn_fuse(rgb_tokens, event_kv, h=H, w=W, patch=self.patch_size)
+        elif self.fusion == "none":
+            patch_tokens = rgb_tokens
+        else:
+            raise ValueError(f"Unsupported fusion mode: {self.fusion}")
+
+        if self.debug_fusion and self._debug_print_count < 3:
+            logger.info(
+                "Fusion debug | rgb_tokens=%s fused_tokens=%s mean(rgb)=%.6f mean(fused)=%.6f",
+                tuple(rgb_tokens.shape),
+                tuple(patch_tokens.shape),
+                rgb_tokens.mean().item(),
+                patch_tokens.mean().item(),
+            )
+            self._debug_print_count += 1
 
         _, P, C = patch_tokens.shape
 
@@ -292,6 +333,10 @@ class Aggregator(nn.Module):
         if use_cache:      
             return output_list, self.patch_start_idx, past_key_values
         return output_list, self.patch_start_idx
+
+    def freeze_backbone(self):
+        for p in self.patch_embed.parameters():
+            p.requires_grad = False
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
