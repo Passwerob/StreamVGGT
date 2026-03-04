@@ -30,6 +30,14 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--conf_threshold", type=float, default=0.0)
     p.add_argument("--max_frames", type=int, default=-1)
+    p.add_argument(
+        "--resize_hw",
+        type=int,
+        nargs=2,
+        default=[154, 266],
+        metavar=("H", "W"),
+        help="Fixed resize resolution (H W) before inference, should match training resolution policy.",
+    )
     return p.parse_args()
 
 
@@ -58,7 +66,7 @@ def load_checkpoint(path: str):
     return {k.replace("module.", "", 1): v for k, v in sd.items()}
 
 
-def load_sequence(data_root: Path, event_in_chans: int, max_frames: int = -1):
+def load_sequence(data_root: Path, event_in_chans: int, resize_hw: Tuple[int, int], patch_size: int, max_frames: int = -1):
     image_dir = data_root / "images"
     event_dir = data_root / "events"
     if not image_dir.is_dir() or not event_dir.is_dir():
@@ -80,8 +88,16 @@ def load_sequence(data_root: Path, event_in_chans: int, max_frames: int = -1):
 
     views = []
     frame_names = []
+    out_h, out_w = int(resize_hw[0]), int(resize_hw[1])
+    if out_h % patch_size != 0 or out_w % patch_size != 0:
+        raise ValueError(
+            f"resize_hw {(out_h, out_w)} must be divisible by patch_size={patch_size}; "
+            f"got H%patch={out_h % patch_size}, W%patch={out_w % patch_size}"
+        )
+
     for ip, ep in items:
         img = Image.open(ip).convert("RGB")
+        img = img.resize((out_w, out_h), resample=Image.BICUBIC)
         img_t = torch.from_numpy(np.array(img)).float() / 255.0
         img_t = img_t.permute(2, 0, 1).contiguous()  # [3,H,W], 0..1
 
@@ -96,7 +112,12 @@ def load_sequence(data_root: Path, event_in_chans: int, max_frames: int = -1):
         if evt.shape[0] != event_in_chans:
             raise RuntimeError(f"event_in_chans mismatch at {ep}: expected {event_in_chans}, got {evt.shape[0]}")
         if evt.shape[-2:] != img_t.shape[-2:]:
-            evt = F.interpolate(evt.unsqueeze(0), size=img_t.shape[-2:], mode="bilinear", align_corners=False).squeeze(0)
+            evt = F.interpolate(
+                evt.unsqueeze(0),
+                size=img_t.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
 
         views.append({"img": img_t.unsqueeze(0), "event_voxel": evt.unsqueeze(0)})
         frame_names.append(ip.name)
@@ -177,7 +198,13 @@ def main():
 
     model.eval()
 
-    views, frame_names = load_sequence(Path(args.data_root), args.event_in_chans, args.max_frames)
+    views, frame_names = load_sequence(
+        Path(args.data_root),
+        args.event_in_chans,
+        tuple(args.resize_hw),
+        args.patch_size,
+        args.max_frames,
+    )
     autocast_dtype = choose_dtype(args.autocast, device)
 
     merged_xyz, merged_rgb, merged_conf = [], [], []
