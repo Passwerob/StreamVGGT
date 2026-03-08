@@ -27,9 +27,9 @@ only_rgb_loss: False
 debug_fusion: False
 rgv_framewise_train: True
 rgv_random_num_frames: False
-rgv_min_frames: 1
+rgv_min_frames: 8
 rgv_max_frames: 30
-rgv_sample_mode: random
+rgv_sample_mode: contiguous
 quiet_pil: True
 allow_repeat: False
 
