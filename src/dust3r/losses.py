@@ -25,6 +25,13 @@ from dust3r.utils.camera import (
 )
 
 
+def check_and_fix_inf_nan(tensor: torch.Tensor, name: str = "tensor") -> torch.Tensor:
+    if not torch.isfinite(tensor).all():
+        bad = (~torch.isfinite(tensor)).sum().item()
+        print(f"[warn] {name} has {bad} non-finite values; replacing with finite numbers")
+        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+    return tensor
+
 
 def Sum(*losses_and_masks):
     loss, mask = losses_and_masks[0]
@@ -1396,9 +1403,17 @@ class DistillLoss(MultiLoss):
             if ('depth' in g) and ('depth' in p):
                 sigma_p = p['depth_conf']
                 sigma_g = g['depth_conf']
-                valid_mask = g['valid_mask']
+                valid_mask = g.get('valid_mask', None)
+                target_hw = p['depth'].shape[1:3]
+                if valid_mask is None:
+                    valid_mask = torch.ones(target_hw, dtype=torch.bool, device=p['depth'].device).unsqueeze(0).repeat(p['depth'].shape[0], 1, 1)
+                else:
+                    if valid_mask.shape[1:3] != target_hw:
+                        vm = valid_mask.float().unsqueeze(1)
+                        vm = F.interpolate(vm, size=target_hw, mode="nearest")
+                        valid_mask = vm[:, 0].to(torch.bool)
                 if not valid_mask.any():
-                    valid_mask = torch.ones_like(g['valid_mask'])
+                    valid_mask = torch.ones_like(valid_mask)
                 depth_terms.append(self.depth_loss(p['depth'], g['depth'], sigma_p, sigma_g, valid_mask))
         Ldepth = torch.stack(depth_terms).mean() if depth_terms else torch.zeros_like(Lcamera)
 
@@ -1407,9 +1422,17 @@ class DistillLoss(MultiLoss):
         for g,p in zip(gts,preds):
             sigma_p = p['conf']
             sigma_g = g['conf']
-            valid_mask = g['valid_mask']
+            valid_mask = g.get('valid_mask', None)
+            target_hw = p['pts3d_in_other_view'].shape[1:3]
+            if valid_mask is None:
+                valid_mask = torch.ones(target_hw, dtype=torch.bool, device=p['pts3d_in_other_view'].device).unsqueeze(0).repeat(p['pts3d_in_other_view'].shape[0], 1, 1)
+            else:
+                if valid_mask.shape[1:3] != target_hw:
+                    vm = valid_mask.float().unsqueeze(1)
+                    vm = F.interpolate(vm, size=target_hw, mode="nearest")
+                    valid_mask = vm[:, 0].to(torch.bool)
             if not valid_mask.any():
-                valid_mask = torch.ones_like(g['valid_mask'])
+                valid_mask = torch.ones_like(valid_mask)
             pmap_terms.append(
                 self.pmap_loss(p['pts3d_in_other_view'],
                                g['pts3d_in_other_view'],
