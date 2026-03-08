@@ -86,6 +86,7 @@ class DinoVisionTransformer(nn.Module):
 
         # tricky but makes it work
         self.use_checkpoint = False
+        self.use_reentrant = False
         #
 
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models

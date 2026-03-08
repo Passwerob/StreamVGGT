@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import logging
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from streamvggt.models.aggregator import Aggregator
@@ -10,16 +11,35 @@ from transformers.file_utils import ModelOutput
 from typing import Optional, Tuple, List, Any
 from dataclasses import dataclass
 
+logger = logging.getLogger(__name__)
+
 @dataclass
 class StreamVGGTOutput(ModelOutput):
     ress: Optional[List[dict]] = None
     views: Optional[torch.Tensor] = None
 
 class StreamVGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024):
+    def __init__(
+        self,
+        img_size=518,
+        patch_size=14,
+        embed_dim=1024,
+        fusion="none",
+        event_in_chans=8,
+        fusion_heads=8,
+        debug_fusion=False,
+    ):
         super().__init__()
 
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            fusion=fusion,
+            event_in_chans=event_in_chans,
+            fusion_heads=fusion_heads,
+            debug_fusion=debug_fusion,
+        )
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
@@ -39,6 +59,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         images = torch.stack(
             [view["img"] for view in views], dim=0
         ).permute(1, 0, 2, 3, 4)    # B S C H W
+        event_voxel = None
+        if "event_voxel" in views[0]:
+            event_voxel = torch.stack([view["event_voxel"] for view in views], dim=0).permute(1, 0, 2, 3, 4)
 
         # If without batch dimension, add it
         if len(images.shape) == 4:
@@ -49,7 +72,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         if history_info is None:
             history_info = {"token": None}
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        aggregated_tokens_list, patch_start_idx = self.aggregator(images, event_voxel=event_voxel)
         predictions = {}
 
         with torch.cuda.amp.autocast(enabled=False):
@@ -70,6 +93,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
+                predictions["rgb"] = torch.sigmoid(pts3d[..., :3])
 
             if self.track_head is not None and query_points is not None:
                 track_list, vis, conf = self.track_head(
@@ -90,6 +114,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     'depth': predictions['depth'][:, s],  # [B, H, W, 1]
                     'depth_conf': predictions['depth_conf'][:, s],  # [B, H, W]
                     'camera_pose': predictions['pose_enc'][:, s, :],  # [B, 9]
+                    'rgb': predictions['rgb'][:, s],
 
                     **({'valid_mask': views[s]["valid_mask"]}
                     if 'valid_mask' in views[s] else {}),  # [B, H, W]
@@ -110,11 +135,15 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         processed_frames = []
 
         for i, frame in enumerate(frames):
-            images = frame["img"].unsqueeze(0) 
+            images = frame["img"].unsqueeze(0)
+            event_voxel = None
+            if "event_voxel" in frame:
+                event_voxel = frame["event_voxel"].unsqueeze(0)
             aggregator_output = self.aggregator(
-                images, 
+                images,
+                event_voxel=event_voxel,
                 past_key_values=past_key_values,
-                use_cache=True, 
+                use_cache=True,
                 past_frame_idx=i
             )
             
@@ -170,3 +199,17 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         
         output = StreamVGGTOutput(ress=all_ress, views=processed_frames)
         return output
+
+    def freeze_backbone(self):
+        self.aggregator.freeze_backbone()
+
+    def gradient_checkpointing_enable(self):
+        if hasattr(self.aggregator, "patch_embed") and hasattr(self.aggregator.patch_embed, "use_checkpoint"):
+            self.aggregator.patch_embed.use_checkpoint = True
+            logger.info("Enabled gradient checkpointing for patch_embed")
+        else:
+            logger.warning("gradient_checkpointing_enable requested, but patch_embed has no use_checkpoint flag")
+
+    def gradient_checkpointing_disable(self):
+        if hasattr(self.aggregator, "patch_embed") and hasattr(self.aggregator.patch_embed, "use_checkpoint"):
+            self.aggregator.patch_embed.use_checkpoint = False

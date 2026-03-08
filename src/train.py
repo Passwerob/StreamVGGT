@@ -21,6 +21,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
@@ -33,7 +34,7 @@ from dust3r.model import (
 )  # noqa: F401, needed when loading the model
 from dust3r.datasets import get_data_loader
 from dust3r.losses import *  # noqa: F401, needed when loading the model
-from dust3r.inference import loss_of_one_batch  # noqa
+from dust3r.inference import loss_of_one_batch, sample_query_points  # noqa
 from dust3r.viz import colorize
 from dust3r.utils.render import get_render_results
 import dust3r.utils.path_to_croco  # noqa: F401
@@ -55,8 +56,9 @@ from accelerate.logging import get_logger
 from datetime import timedelta
 import torch.multiprocessing
 
-from vggt.models.vggt import VGGT
 from streamvggt.models.streamvggt import StreamVGGT
+from streamvggt.data.rgv_interval49 import RGVIntervalFixed49Dataset
+from vggt.models.vggt import VGGT
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -112,6 +114,10 @@ def save_current_code(outdir):
 
 def train(args):
 
+    if getattr(args, "quiet_pil", True):
+        logging.getLogger("PIL").setLevel(logging.WARNING)
+        logging.getLogger("PIL.PngImagePlugin").setLevel(logging.WARNING)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.accum_iter,
         mixed_precision="bf16",
@@ -150,105 +156,124 @@ def train(args):
     cudnn.benchmark = args.benchmark
 
     # training dataset and loader
-    printer.info("Building train dataset %s", args.train_dataset)
-    #  dataset and loader
-    data_loader_train = build_dataset(
-        args.train_dataset,
-        args.batch_size,
-        args.num_workers,
-        accelerator=accelerator,
-        test=False,
-        fixed_length=args.fixed_length
-    )
-    printer.info("Building test dataset %s", args.test_dataset)
-    data_loader_test = {
-        dataset.split("(")[0]: build_dataset(
-            dataset,
+    if args.dataset == "rgv49":
+        printer.info("Building train dataset rgv49 from %s", args.data_root)
+        data_loader_train = build_dataset(
+            args.train_dataset,
             args.batch_size,
             args.num_workers,
             accelerator=accelerator,
-            test=True,
-            fixed_length=True
+            test=False,
+            fixed_length=True,
+            args=args,
         )
-        for dataset in args.test_dataset.split("+")
-    }
+        data_loader_test = {}
+    else:
+        printer.info("Building train dataset %s", args.train_dataset)
+        data_loader_train = build_dataset(
+            args.train_dataset,
+            args.batch_size,
+            args.num_workers,
+            accelerator=accelerator,
+            test=False,
+            fixed_length=args.fixed_length
+        )
+        printer.info("Building test dataset %s", args.test_dataset)
+        data_loader_test = {
+            dataset.split("(")[0]: build_dataset(
+                dataset,
+                args.batch_size,
+                args.num_workers,
+                accelerator=accelerator,
+                test=True,
+                fixed_length=True,
+                args=args,
+            )
+            for dataset in args.test_dataset.split("+")
+        }
 
     # model
     printer.info("Loading model")
-    model = StreamVGGT()
-    teacher = VGGT()
+    model = StreamVGGT(
+        fusion=args.fusion,
+        event_in_chans=args.event_in_chans,
+        fusion_heads=args.fusion_heads,
+        debug_fusion=args.debug_fusion,
+    )
+    teacher = None
+
+    if args.fusion == "crossattn" and args.dataset != "rgv49":
+        printer.warning("fusion=crossattn but dataset has no event_voxel by default; fallback to fusion=none")
+        model.aggregator.fusion = "none"
 
     # model: PreTrainedModel = eval(args.model)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
 
 
     printer.info(f">> Creating train criterion = {args.train_criterion}")
-    train_criterion = eval(args.train_criterion).to(device)
-    printer.info(
-        f">> Creating test criterion = {args.test_criterion or args.train_criterion}"
-    )
-    test_criterion = eval(args.test_criterion or args.criterion).to(device)
+    train_criterion = eval(args.train_criterion).to(device) if not args.only_rgb_loss else None
+    test_criterion = train_criterion
 
     model.to(device)
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        else:
+            printer.warning("gradient_checkpointing=True ignored: model has no gradient_checkpointing_enable()")
     if args.long_context:
         model.fixed_input_length = False
 
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
-        printer.info(
-            model.load_state_dict(ckpt, strict=True)
-        )
+
+        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        if isinstance(state_dict, dict):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+        strict_load = bool(args.pretrained_strict)
+        if args.fusion == "crossattn":
+            strict_load = False
+
+        load_msg = model.load_state_dict(state_dict, strict=strict_load)
+        printer.info(f"Pretrained load (strict={strict_load}): {load_msg}")
+
+        if args.fusion == "crossattn" and load_msg.missing_keys:
+            non_fusion_missing = [k for k in load_msg.missing_keys if not k.startswith("aggregator.event_") and not k.startswith("aggregator.cross_attn_fuse")]
+            if non_fusion_missing:
+                raise RuntimeError(
+                    "Unexpected missing non-fusion keys when loading pretrained checkpoint: "
+                    + ", ".join(non_fusion_missing[:20])
+                )
+
         del ckpt  # in case it occupies memory
 
-    printer.info("Loading teacher model")
-    ckpt_teacher = torch.load(args.pretrained, map_location=device)
-    teacher.load_state_dict(ckpt_teacher, strict=True)
-    teacher = teacher.to("cuda")
-    for p in teacher.parameters():
-        p.requires_grad = False  
-    teacher.eval()
-    del ckpt_teacher
+    if not args.only_rgb_loss:
+        teacher = VGGT().to(device)
+        teacher_ckpt_path = args.teacher if getattr(args, "teacher", None) else args.pretrained
+        if teacher_ckpt_path is None:
+            raise ValueError("only_rgb_loss=False requires teacher checkpoint (set teacher or pretrained)")
+        printer.info(f"Loading teacher model from: {teacher_ckpt_path}")
+        teacher_ckpt = torch.load(teacher_ckpt_path, map_location=device)
+        teacher_state = teacher_ckpt["model"] if isinstance(teacher_ckpt, dict) and "model" in teacher_ckpt else teacher_ckpt
+        if isinstance(teacher_state, dict):
+            teacher_state = {k.replace("module.", "", 1): v for k, v in teacher_state.items()}
+        teacher.load_state_dict(teacher_state, strict=True)
+        for p in teacher.parameters():
+            p.requires_grad = False
+        teacher.eval()
+        del teacher_ckpt
 
-
-    # freeze
-    printer.info("Freezing patch embedding and positional encoding parameters...")
-    frozen_params = 0
-    total_params = 0
-
-    frozen_param_names = []
-
-    for name, param in model.named_parameters():
-        total_params += param.numel()
+    for _, param in model.named_parameters():
         param.requires_grad = True
+    if args.freeze_backbone:
+        model.freeze_backbone()
 
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'patch_embed'):
-        for param in model.aggregator.patch_embed.parameters():
-            if param.requires_grad:
-                param.requires_grad = False
-
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'camera_token'):
-        model.aggregator.camera_token.requires_grad = False
-
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'register_token'):
-        model.aggregator.register_token.requires_grad = False
-
-
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            frozen_params += p.numel()
-            frozen_param_names.append(name)
-
-    printer.info(
-        f"Frozen {frozen_params:,} parameters out of {total_params:,} total parameters. ({frozen_params / total_params:.2%})")
-    printer.info(
-        f"Trainable parameters: {total_params - frozen_params:,} ({(total_params - frozen_params) / total_params:.2%})")
-    if frozen_param_names:
-        printer.info(
-            f"Example frozen parameters: {', '.join(frozen_param_names[:5])}{'...' if len(frozen_param_names) > 5 else ''}")
+    backbone_trainable = sum(p.numel() for p in model.aggregator.patch_embed.parameters() if p.requires_grad)
+    fusion_heads_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) - backbone_trainable
+    printer.info(f"backbone trainable params = {backbone_trainable}")
+    printer.info(f"fusion+heads trainable params = {fusion_heads_trainable}")
 
 
 
@@ -372,7 +397,26 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=No
     misc.save_on_master(accelerator, to_save, checkpoint_path)
 
 
-def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False):
+def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False, args=None):
+    if args is not None and args.dataset == "rgv49":
+        if args.fixed_frames != 49:
+            raise ValueError(f"--fixed_frames must be 49 for rgv49 dataset, got {args.fixed_frames}")
+        dataset_obj = RGVIntervalFixed49Dataset(
+            data_root=args.data_root,
+            split=args.split,
+            fixed_frames=args.fixed_frames,
+            event_in_chans=args.event_in_chans,
+            resolution=tuple(args.resolution) if args.resolution is not None else None,
+        )
+        return DataLoader(
+            dataset_obj,
+            batch_size=batch_size,
+            shuffle=not test,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=not test,
+        )
+
     split = ["Train", "Test"][test]
     printer.info(f"Building {split} Data loader for dataset: {dataset}")
     loader = get_data_loader(
@@ -442,7 +486,41 @@ def train_one_epoch(
     data_iter = metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
 
     for data_iter_step, batch in enumerate(data_iter):
-            
+
+        rgb_seq = None
+        event_seq = None
+        rgv_views = None
+        if args.dataset == "rgv49":
+            rgb_seq = batch["rgb"]  # [B,T,3,H,W], normalized to [-1,1]
+            event_seq = batch["event"]  # [B,T,C,H,W]
+            if rgb_seq.shape[1] != 49 or event_seq.shape[1] != 49:
+                raise RuntimeError(
+                    f"RGV49 fixed frame count mismatch: rgb_T={rgb_seq.shape[1]}, event_T={event_seq.shape[1]}"
+                )
+
+            if getattr(args, "rgv_random_num_frames", False):
+                total_frames = rgb_seq.shape[1]
+                min_frames = max(1, int(getattr(args, "rgv_min_frames", 1)))
+                max_frames = min(total_frames, int(getattr(args, "rgv_max_frames", total_frames)))
+                if min_frames > max_frames:
+                    raise ValueError(
+                        f"Invalid rgv frame sampling range: min={min_frames}, max={max_frames}, total={total_frames}"
+                    )
+
+                sample_len = random.randint(min_frames, max_frames)
+                sample_mode = str(getattr(args, "rgv_sample_mode", "random")).lower()
+                if sample_mode == "contiguous":
+                    start = random.randint(0, total_frames - sample_len)
+                    frame_idx = torch.arange(start, start + sample_len, device=rgb_seq.device)
+                elif sample_mode == "random":
+                    frame_idx = torch.randperm(total_frames, device=rgb_seq.device)[:sample_len]
+                    frame_idx = torch.sort(frame_idx).values
+                else:
+                    raise ValueError(f"Unsupported rgv_sample_mode={sample_mode}, choose from random/contiguous")
+
+                rgb_seq = rgb_seq.index_select(1, frame_idx)
+                event_seq = event_seq.index_select(1, frame_idx)
+
         with accelerator.accumulate(model):
             # change the range of the image to [0, 1]
             if isinstance(batch, dict) and "img" in batch:
@@ -450,6 +528,20 @@ def train_one_epoch(
             elif isinstance(batch, list) and all(isinstance(v, dict) and "img" in v for v in batch):
                 for view in batch:
                     view["img"] = (view["img"] + 1.0) / 2.0
+
+            if args.dataset == "rgv49":
+                rgb_seq = (rgb_seq + 1.0) / 2.0
+                T = rgb_seq.shape[1]
+                rgv_views = [
+                    {
+                        "img": rgb_seq[:, t],
+                        "event_voxel": event_seq[:, t],
+                        "is_metric": False,
+                    }
+                    for t in range(T)
+                ]
+                if not getattr(args, "rgv_framewise_train", True):
+                    batch = rgv_views
 
             epoch_f = epoch + data_iter_step / len(data_loader)
             # we use a per iteration (instead of per epoch) lr scheduler
@@ -459,18 +551,52 @@ def train_one_epoch(
             epoch_f = epoch + data_iter_step / len(data_loader)
             step = int(epoch_f * len(data_loader))
 
-            result = loss_of_one_batch(
-                batch,
-                model,
-                criterion,
-                accelerator,
-                teacher=teacher,
-                inference=False,
-                symmetrize_batch=False,
-                use_amp=bool(args.amp),
-            )
-      
-            loss, loss_details = result["loss"]  # criterion returns two values
+            if args.only_rgb_loss:
+                if args.dataset == "rgv49" and getattr(args, "rgv_framewise_train", True):
+                    output = model.inference(rgv_views, None)
+                    preds = output.ress
+                    pred_rgb = torch.stack([pred["rgb"] for pred in preds], dim=1)
+                    rgb_gt = torch.stack([view["img"].permute(0, 2, 3, 1) for view in rgv_views], dim=1)
+                    loss = F.mse_loss(pred_rgb, rgb_gt)
+                    already_backprop = False
+                    batch = rgv_views
+                else:
+                    query_pts = None
+                    if "valid_mask" in batch[0]:
+                        query_pts = sample_query_points(batch[0]['valid_mask'], M=64).to(device=batch[0]["img"].device)
+                    output = model(batch, query_pts)
+                    preds = output.ress
+                    pred_rgb = torch.stack([pred["rgb"] for pred in preds], dim=1)
+                    rgb_gt = torch.stack([view["img"].permute(0, 2, 3, 1) for view in batch], dim=1)
+                    loss = F.mse_loss(pred_rgb, rgb_gt)
+                    already_backprop = False
+                loss_details = {"loss_rgb": float(loss)}
+            else:
+                if args.dataset == "rgv49" and getattr(args, "rgv_framewise_train", True):
+                    query_pts = None
+                    if "valid_mask" in rgv_views[0]:
+                        query_pts = sample_query_points(rgv_views[0]['valid_mask'], M=64).to(device=rgv_views[0]["img"].device)
+                    output = model.inference(rgv_views, query_pts)
+                    preds, batch = output.ress, output.views
+                    with torch.no_grad():
+                        knowledge = teacher.inference(batch, query_pts)
+                        gts, batch = knowledge.ress, knowledge.views
+                    with torch.cuda.amp.autocast(enabled=False):
+                        loss, loss_details = criterion(gts, preds)
+                    already_backprop = False
+                else:
+                    result = loss_of_one_batch(
+                        batch,
+                        model,
+                        criterion,
+                        accelerator,
+                        teacher=teacher,
+                        inference=False,
+                        symmetrize_batch=False,
+                        use_amp=bool(args.amp),
+                    )
+                    loss, loss_details = result["loss"]  # criterion returns two values
+                    already_backprop = result.get("already_backprop", False)
 
             loss_value = float(loss)
 
@@ -479,7 +605,7 @@ def train_one_epoch(
                     f"Loss is {loss_value}, stopping training, loss details: {loss_details}"
                 )
                 sys.exit(1)
-            if not result.get("already_backprop", False):
+            if not already_backprop:
                 loss_scaler(
                     loss,
                     optimizer,
@@ -489,7 +615,7 @@ def train_one_epoch(
                 )
                 optimizer.zero_grad()
 
-            is_metric = batch[0]["is_metric"]
+            is_metric = batch[0].get("is_metric", False)
             curr_num_view = len(batch)
 
             del loss
