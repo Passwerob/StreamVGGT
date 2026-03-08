@@ -25,6 +25,13 @@ from dust3r.utils.camera import (
 )
 
 
+def check_and_fix_inf_nan(tensor: torch.Tensor, name: str = "tensor") -> torch.Tensor:
+    if not torch.isfinite(tensor).all():
+        bad = (~torch.isfinite(tensor)).sum().item()
+        print(f"[warn] {name} has {bad} non-finite values; replacing with finite numbers")
+        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+    return tensor
+
 
 def Sum(*losses_and_masks):
     loss, mask = losses_and_masks[0]
