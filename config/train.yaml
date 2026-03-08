@@ -1,5 +1,11 @@
 teacher: ../ckpt/model.pt
 pretrained: ../ckpt/model.pt
+pretrained_strict: True
+dataset: default
+data_root: /data/fcr/data/rgv_interval_final/raw_data
+fixed_frames: 49
+split: all
+resolution: [518, 392]
 load_only_encoder: False
 long_context: False
 fixed_length: True
@@ -12,6 +18,19 @@ n_corres_test: 0
 
 train_criterion: DistillLoss()
 test_criterion: DistillLoss()
+fusion: none
+event_in_chans: 8
+fusion_heads: 8
+freeze_backbone: True
+rgb_loss: mse
+only_rgb_loss: False
+debug_fusion: False
+rgv_framewise_train: True
+rgv_random_num_frames: False
+rgv_min_frames: 8
+rgv_max_frames: 30
+rgv_sample_mode: contiguous
+quiet_pil: True
 allow_repeat: False
 
 dataset1: Co3d_Multi(allow_repeat=${allow_repeat}, split='train', ROOT='../data/train/processed_co3d/', 
