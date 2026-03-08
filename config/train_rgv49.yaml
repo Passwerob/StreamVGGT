@@ -11,7 +11,7 @@ resolution: [518, 392]
 fusion: crossattn
 event_in_chans: 8
 freeze_backbone: True
-only_rgb_loss: True
+only_rgb_loss: False
 rgb_loss: mse
 pretrained_strict: False
 rgv_framewise_train: True

@@ -489,6 +489,7 @@ def train_one_epoch(
 
         rgb_seq = None
         event_seq = None
+        rgv_views = None
         if args.dataset == "rgv49":
             rgb_seq = batch["rgb"]  # [B,T,3,H,W], normalized to [-1,1]
             event_seq = batch["event"]  # [B,T,C,H,W]
@@ -520,17 +521,6 @@ def train_one_epoch(
                 rgb_seq = rgb_seq.index_select(1, frame_idx)
                 event_seq = event_seq.index_select(1, frame_idx)
 
-            if not getattr(args, "rgv_framewise_train", True):
-                T = rgb_seq.shape[1]
-                batch = [
-                    {
-                        "img": rgb_seq[:, t],
-                        "event_voxel": event_seq[:, t],
-                        "is_metric": False,
-                    }
-                    for t in range(T)
-                ]
-            
         with accelerator.accumulate(model):
             # change the range of the image to [0, 1]
             if isinstance(batch, dict) and "img" in batch:
@@ -539,8 +529,19 @@ def train_one_epoch(
                 for view in batch:
                     view["img"] = (view["img"] + 1.0) / 2.0
 
-            if args.dataset == "rgv49" and getattr(args, "rgv_framewise_train", True):
+            if args.dataset == "rgv49":
                 rgb_seq = (rgb_seq + 1.0) / 2.0
+                T = rgb_seq.shape[1]
+                rgv_views = [
+                    {
+                        "img": rgb_seq[:, t],
+                        "event_voxel": event_seq[:, t],
+                        "is_metric": False,
+                    }
+                    for t in range(T)
+                ]
+                if not getattr(args, "rgv_framewise_train", True):
+                    batch = rgv_views
 
             epoch_f = epoch + data_iter_step / len(data_loader)
             # we use a per iteration (instead of per epoch) lr scheduler
@@ -552,24 +553,13 @@ def train_one_epoch(
 
             if args.only_rgb_loss:
                 if args.dataset == "rgv49" and getattr(args, "rgv_framewise_train", True):
-                    T = rgb_seq.shape[1]
-                    loss = torch.zeros((), device=rgb_seq.device)
-                    for t in range(T):
-                        frame_batch = [{"img": rgb_seq[:, t], "event_voxel": event_seq[:, t], "is_metric": False}]
-                        output = model(frame_batch, None)
-                        pred_rgb = output.ress[0]["rgb"]
-                        rgb_gt = rgb_seq[:, t].permute(0, 2, 3, 1)
-                        frame_loss = F.mse_loss(pred_rgb, rgb_gt)
-                        loss = loss + frame_loss.detach()
-                        accelerator.backward(frame_loss / T)
-
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-                    loss = loss / T
-                    already_backprop = True
-                    batch = [{"is_metric": False}]
+                    output = model.inference(rgv_views, None)
+                    preds = output.ress
+                    pred_rgb = torch.stack([pred["rgb"] for pred in preds], dim=1)
+                    rgb_gt = torch.stack([view["img"].permute(0, 2, 3, 1) for view in rgv_views], dim=1)
+                    loss = F.mse_loss(pred_rgb, rgb_gt)
+                    already_backprop = False
+                    batch = rgv_views
                 else:
                     query_pts = None
                     if "valid_mask" in batch[0]:
@@ -582,18 +572,31 @@ def train_one_epoch(
                     already_backprop = False
                 loss_details = {"loss_rgb": float(loss)}
             else:
-                result = loss_of_one_batch(
-                    batch,
-                    model,
-                    criterion,
-                    accelerator,
-                    teacher=teacher,
-                    inference=False,
-                    symmetrize_batch=False,
-                    use_amp=bool(args.amp),
-                )
-                loss, loss_details = result["loss"]  # criterion returns two values
-                already_backprop = result.get("already_backprop", False)
+                if args.dataset == "rgv49" and getattr(args, "rgv_framewise_train", True):
+                    query_pts = None
+                    if "valid_mask" in rgv_views[0]:
+                        query_pts = sample_query_points(rgv_views[0]['valid_mask'], M=64).to(device=rgv_views[0]["img"].device)
+                    output = model.inference(rgv_views, query_pts)
+                    preds, batch = output.ress, output.views
+                    with torch.no_grad():
+                        knowledge = teacher.inference(batch, query_pts)
+                        gts, batch = knowledge.ress, knowledge.views
+                    with torch.cuda.amp.autocast(enabled=False):
+                        loss, loss_details = criterion(gts, preds)
+                    already_backprop = False
+                else:
+                    result = loss_of_one_batch(
+                        batch,
+                        model,
+                        criterion,
+                        accelerator,
+                        teacher=teacher,
+                        inference=False,
+                        symmetrize_batch=False,
+                        use_amp=bool(args.amp),
+                    )
+                    loss, loss_details = result["loss"]  # criterion returns two values
+                    already_backprop = result.get("already_backprop", False)
 
             loss_value = float(loss)
 
