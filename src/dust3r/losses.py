@@ -25,7 +25,6 @@ from dust3r.utils.camera import (
 )
 
 
-
 def Sum(*losses_and_masks):
     loss, mask = losses_and_masks[0]
     if loss.ndim > 0:
@@ -1187,9 +1186,9 @@ class CameraLoss(nn.Module):
         loss_R = (pred_pose[..., 3:7] - gt_pose[..., 3:7]).abs()
         loss_FL = (pred_pose[..., 7:] - gt_pose[..., 7:]).abs()
 
-        loss_T = check_and_fix_inf_nan(loss_T, "loss_T")
-        loss_R = check_and_fix_inf_nan(loss_R, "loss_R")
-        loss_FL = check_and_fix_inf_nan(loss_FL, "loss_FL")
+        loss_T = torch.nan_to_num(loss_T, nan=0.0, posinf=1e4, neginf=-1e4)
+        loss_R = torch.nan_to_num(loss_R, nan=0.0, posinf=1e4, neginf=-1e4)
+        loss_FL = torch.nan_to_num(loss_FL, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # Clamp outlier translation loss to prevent instability, then average
         loss_T = loss_T.clamp(max=100).mean()
@@ -1354,9 +1353,11 @@ class FinetuneLoss(MultiLoss):
         for g,p in zip(gts, preds):
             if ('depth' in p):
                 sigma_p = p['depth_conf']
-                valid_mask = g['valid_mask']
+                valid_mask = g.get('valid_mask')
+                if valid_mask is None:
+                    valid_mask = torch.ones_like(g['depth_conf'], dtype=torch.bool)
                 if not valid_mask.any():
-                    valid_mask = torch.ones_like(g['valid_mask'])
+                    valid_mask = torch.ones_like(valid_mask)
                 depth_terms.append(self.depth_loss(p['depth'], g['depthmap'].unsqueeze(-1), sigma_p=sigma_p, valid_mask=valid_mask))
         Ldepth = torch.stack(depth_terms).mean() if depth_terms else torch.zeros_like(Lcamera)
 
@@ -1396,9 +1397,11 @@ class DistillLoss(MultiLoss):
             if ('depth' in g) and ('depth' in p):
                 sigma_p = p['depth_conf']
                 sigma_g = g['depth_conf']
-                valid_mask = g['valid_mask']
+                valid_mask = g.get('valid_mask')
+                if valid_mask is None:
+                    valid_mask = torch.ones_like(g['depth_conf'], dtype=torch.bool)
                 if not valid_mask.any():
-                    valid_mask = torch.ones_like(g['valid_mask'])
+                    valid_mask = torch.ones_like(valid_mask)
                 depth_terms.append(self.depth_loss(p['depth'], g['depth'], sigma_p, sigma_g, valid_mask))
         Ldepth = torch.stack(depth_terms).mean() if depth_terms else torch.zeros_like(Lcamera)
 
@@ -1407,9 +1410,11 @@ class DistillLoss(MultiLoss):
         for g,p in zip(gts,preds):
             sigma_p = p['conf']
             sigma_g = g['conf']
-            valid_mask = g['valid_mask']
+            valid_mask = g.get('valid_mask')
+            if valid_mask is None:
+                valid_mask = torch.ones_like(g['conf'], dtype=torch.bool)
             if not valid_mask.any():
-                valid_mask = torch.ones_like(g['valid_mask'])
+                valid_mask = torch.ones_like(valid_mask)
             pmap_terms.append(
                 self.pmap_loss(p['pts3d_in_other_view'],
                                g['pts3d_in_other_view'],
