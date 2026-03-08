@@ -210,8 +210,15 @@ def train(args):
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
 
 
+    if args.only_rgb_loss:
+        printer.warning(
+            "only_rgb_loss=True is incompatible with original StreamVGGT-aligned geometry supervision in this repo; "
+            "forcing only_rgb_loss=False to keep distillation-based training behavior."
+        )
+        args.only_rgb_loss = False
+
     printer.info(f">> Creating train criterion = {args.train_criterion}")
-    train_criterion = eval(args.train_criterion).to(device) if not args.only_rgb_loss else None
+    train_criterion = eval(args.train_criterion).to(device)
     test_criterion = train_criterion
 
     model.to(device)
