@@ -201,11 +201,11 @@ If you find this project helpful, please consider citing the following paper:
 Use the fixed-length RGV dataset loader (`dataset=rgv49`) with strict 49-frame alignment.
 
 ```bash
-python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/raw_data fixed_frames=49 split=all fusion=none freeze_backbone=True only_rgb_loss=True
+python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/raw_data fixed_frames=49 split=all fusion=none freeze_backbone=True only_rgb_loss=False
 ```
 
 ```bash
-python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/raw_data fixed_frames=49 split=all fusion=crossattn freeze_backbone=True event_in_chans=8 only_rgb_loss=True
+python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/raw_data fixed_frames=49 split=all fusion=crossattn freeze_backbone=True event_in_chans=8 only_rgb_loss=False
 ```
 
 If your pretrained checkpoint was trained before fusion modules existed, load with non-strict mode:
@@ -217,8 +217,13 @@ python src/train.py --config-name train_rgv49
 or explicitly:
 
 ```bash
-python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/raw_data fixed_frames=49 split=all fusion=crossattn freeze_backbone=True event_in_chans=8 only_rgb_loss=True pretrained_strict=False
+python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/raw_data fixed_frames=49 split=all fusion=crossattn freeze_backbone=True event_in_chans=8 only_rgb_loss=False pretrained_strict=False
 ```
+
+> **Important**
+>
+> To stay aligned with the original StreamVGGT supervision, keep `only_rgb_loss=False`.
+> The model's `pred["rgb"]` is derived from point-head outputs (`sigmoid(pts3d[..., :3])`), so RGB-only optimization can unintentionally distort geometry.
 
 For lower memory usage on long sequences, enable frame-wise training over the fixed 49 frames:
 

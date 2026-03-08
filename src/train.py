@@ -214,6 +214,12 @@ def train(args):
     train_criterion = eval(args.train_criterion).to(device) if not args.only_rgb_loss else None
     test_criterion = train_criterion
 
+    if args.only_rgb_loss:
+        printer.warning(
+            "only_rgb_loss=True optimizes pred['rgb'] only; in this codebase pred['rgb'] is derived from "
+            "point-head outputs (sigmoid(pts3d[..., :3])), which may shift geometry away from original StreamVGGT behavior."
+        )
+
     model.to(device)
 
     if args.gradient_checkpointing:
