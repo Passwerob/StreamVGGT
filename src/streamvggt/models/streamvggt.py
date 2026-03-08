@@ -135,11 +135,15 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         processed_frames = []
 
         for i, frame in enumerate(frames):
-            images = frame["img"].unsqueeze(0) 
+            images = frame["img"].unsqueeze(0)
+            event_voxel = None
+            if "event_voxel" in frame:
+                event_voxel = frame["event_voxel"].unsqueeze(0)
             aggregator_output = self.aggregator(
-                images, 
+                images,
+                event_voxel=event_voxel,
                 past_key_values=past_key_values,
-                use_cache=True, 
+                use_cache=True,
                 past_frame_idx=i
             )
             
