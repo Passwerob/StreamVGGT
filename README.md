@@ -222,8 +222,8 @@ python src/train.py dataset=rgv49 data_root=/data/fcr/data/rgv_interval_final/ra
 
 > **Important**
 >
-> To stay aligned with the original StreamVGGT supervision, keep `only_rgb_loss=False`.
-> The model's `pred["rgb"]` is derived from point-head outputs (`sigmoid(pts3d[..., :3])`), so RGB-only optimization can unintentionally distort geometry.
+> To stay aligned with the original StreamVGGT supervision, use `only_rgb_loss=False`.
+> In this repo, `only_rgb_loss=True` is automatically forced back to `False` during training to prevent RGB-only optimization from distorting geometry.
 
 For lower memory usage on long sequences, enable frame-wise training over the fixed 49 frames:
 
