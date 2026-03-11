@@ -21,6 +21,63 @@ _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
 
+class EventPatchEmbed(nn.Module):
+    def __init__(self, in_chans: int, embed_dim: int, patch_size: int):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(
+            in_channels=in_chans,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, H, W = x.shape
+        if H % self.patch_size != 0 or W % self.patch_size != 0:
+            raise ValueError(
+                f"EventPatchEmbed expects H/W divisible by patch_size={self.patch_size}, got H={H}, W={W}"
+            )
+        x = self.proj(x)
+        x = x.flatten(2).transpose(1, 2)
+        return x
+
+
+class CrossAttnFuse(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(embed_dim)
+        self.norm_kv = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+
+    def forward(self, rgb_tokens: torch.Tensor, event_kv: torch.Tensor) -> torch.Tensor:
+        if rgb_tokens.shape[1] == event_kv.shape[1] + 1:
+            rgb_cls = rgb_tokens[:, :1]
+            rgb_patch = rgb_tokens[:, 1:]
+        else:
+            rgb_cls = None
+            rgb_patch = rgb_tokens
+
+        if rgb_patch.shape[1] != event_kv.shape[1]:
+            raise ValueError(
+                "CrossAttnFuse token count mismatch: "
+                f"rgb_tokens shape={tuple(rgb_tokens.shape)}, "
+                f"rgb_patch shape={tuple(rgb_patch.shape)}, "
+                f"event_kv shape={tuple(event_kv.shape)}"
+            )
+
+        q = self.norm_q(rgb_patch)
+        kv = self.norm_kv(event_kv)
+        attn_out, _ = self.attn(q, kv, kv)
+        fused_patch = rgb_patch + attn_out
+
+        if rgb_cls is not None:
+            fused_tokens = torch.cat([rgb_cls, fused_patch], dim=1)
+        else:
+            fused_tokens = fused_patch
+        return fused_tokens
+
+
 class Aggregator(nn.Module):
     """
     The Aggregator applies alternating-attention over input frames,
@@ -66,6 +123,10 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        fusion="none",
+        use_event=False,
+        event_in_chans=5,
+        event_patch_size=None,
     ):
         super().__init__()
 
@@ -113,6 +174,28 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self.fusion = fusion
+        self.use_event = use_event
+        self.event_patch_size = patch_size if event_patch_size is None else event_patch_size
+
+        if self.fusion not in ["none", "crossattn"]:
+            raise ValueError(f"Unsupported fusion mode: {self.fusion}")
+
+        if self.fusion == "crossattn" or self.use_event:
+            self.event_patch_embed = EventPatchEmbed(
+                in_chans=event_in_chans,
+                embed_dim=embed_dim,
+                patch_size=self.event_patch_size,
+            )
+            self.event_proj = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            self.cross_attn_fuse = CrossAttnFuse(embed_dim=embed_dim, num_heads=num_heads)
+        else:
+            self.event_patch_embed = None
+            self.event_proj = None
+            self.cross_attn_fuse = None
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -188,6 +271,9 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        event_voxel: Optional[torch.Tensor] = None,
+        fusion: Optional[str] = None,
+        use_event: Optional[bool] = None,
         past_key_values=None,
         use_cache=False,
         past_frame_idx=0
@@ -203,6 +289,7 @@ class Aggregator(nn.Module):
                 and the patch_start_idx indicating where patch tokens begin.
         """
         B, S, C_in, H, W = images.shape
+        images_shape = tuple(images.shape)
 
         if use_cache and past_key_values[0] is not None:
             _, _, S_true, _, _ = past_key_values[0][0].shape
@@ -226,7 +313,23 @@ class Aggregator(nn.Module):
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
-        _, P, C = patch_tokens.shape
+        rgb_tokens = patch_tokens
+
+        active_fusion = self.fusion if fusion is None else fusion
+        active_use_event = self.use_event if use_event is None else use_event
+        if active_fusion == "crossattn" and active_use_event and event_voxel is not None:
+            if self.event_patch_embed is None or self.event_proj is None or self.cross_attn_fuse is None:
+                raise RuntimeError("Event fusion is requested but event modules are not initialized.")
+            if event_voxel.shape[:2] != (B, S):
+                raise ValueError(
+                    f"event_voxel shape mismatch with images: images={images_shape}, event_voxel={tuple(event_voxel.shape)}"
+                )
+            event_voxel = event_voxel.reshape(B * S, event_voxel.shape[2], event_voxel.shape[3], event_voxel.shape[4])
+            event_tokens = self.event_patch_embed(event_voxel)
+            event_kv = self.event_proj(event_tokens)
+            rgb_tokens = self.cross_attn_fuse(rgb_tokens, event_kv)
+
+        _, P, C = rgb_tokens.shape
 
         if use_cache:
             camera_token_full = slice_expand_and_flatten(self.camera_token, B, S_true)
@@ -238,7 +341,7 @@ class Aggregator(nn.Module):
             camera_token = slice_expand_and_flatten(self.camera_token, B, S)
             register_token = slice_expand_and_flatten(self.register_token, B, S)
         # Concatenate special tokens with patch tokens
-        tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        tokens = torch.cat([camera_token, register_token, rgb_tokens], dim=1)
 
         pos = None
         if self.rope is not None:
