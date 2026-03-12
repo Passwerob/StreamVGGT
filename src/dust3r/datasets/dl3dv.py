@@ -12,10 +12,25 @@ from dust3r.utils.image import imread_cv2
 
 
 class DL3DV_Multi(BaseMultiViewDataset):
-    def __init__(self, *args, split, ROOT, **kwargs):
+    def __init__(
+        self,
+        *args,
+        split,
+        ROOT,
+        min_interval=1,
+        max_interval=20,
+        video_prob=0.5,
+        fix_interval_prob=0.5,
+        block_shuffle=25,
+        **kwargs,
+    ):
         self.ROOT = ROOT
         self.video = True
-        self.max_interval = 20
+        self.min_interval = min_interval
+        self.max_interval = max_interval
+        self.video_prob = video_prob
+        self.fix_interval_prob = fix_interval_prob
+        self.block_shuffle = block_shuffle
         self.is_metric = False
         super().__init__(*args, **kwargs)
 
@@ -96,8 +111,11 @@ class DL3DV_Multi(BaseMultiViewDataset):
             start_id,
             all_image_ids,
             rng,
+            min_interval=self.min_interval,
             max_interval=self.max_interval,
-            block_shuffle=25,
+            video_prob=self.video_prob,
+            fix_interval_prob=self.fix_interval_prob,
+            block_shuffle=self.block_shuffle,
         )
         image_idxs = np.array(all_image_ids)[pos]
 

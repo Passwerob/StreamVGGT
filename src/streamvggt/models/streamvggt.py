@@ -16,10 +16,27 @@ class StreamVGGTOutput(ModelOutput):
     views: Optional[torch.Tensor] = None
 
 class StreamVGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024):
+    def __init__(
+        self,
+        img_size=518,
+        patch_size=14,
+        embed_dim=1024,
+        fusion="none",
+        use_event=False,
+        event_in_chans=5,
+        event_patch_size=None,
+    ):
         super().__init__()
 
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            fusion=fusion,
+            use_event=use_event,
+            event_in_chans=event_in_chans,
+            event_patch_size=event_patch_size,
+        )
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
@@ -34,7 +51,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         history_info: Optional[dict] = None,
         past_key_values=None,
         use_cache=False,
-        past_frame_idx=0
+        past_frame_idx=0,
+        event_voxel: Optional[torch.Tensor] = None,
+        fusion: Optional[str] = None,
+        use_event: Optional[bool] = None,
     ):
         images = torch.stack(
             [view["img"] for view in views], dim=0
@@ -49,7 +69,15 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         if history_info is None:
             history_info = {"token": None}
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        if event_voxel is None and len(views) > 0 and isinstance(views[0], dict) and "event_voxel" in views[0]:
+            event_voxel = torch.stack([view["event_voxel"] for view in views], dim=0).permute(1, 0, 2, 3, 4)
+
+        aggregated_tokens_list, patch_start_idx = self.aggregator(
+            images,
+            event_voxel=event_voxel,
+            fusion=fusion,
+            use_event=use_event,
+        )
         predictions = {}
 
         with torch.cuda.amp.autocast(enabled=False):
@@ -101,8 +129,16 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 }
                 ress.append(res)
             return StreamVGGTOutput(ress=ress, views=views)  # [S] [B, C, H, W]
+
+    def load_state_dict(self, state_dict, strict=True):
+        if strict:
+            try:
+                return super().load_state_dict(state_dict, strict=True)
+            except RuntimeError:
+                return super().load_state_dict(state_dict, strict=False)
+        return super().load_state_dict(state_dict, strict=False)
         
-    def inference(self, frames, query_points: torch.Tensor = None, past_key_values=None):        
+    def inference(self, frames, query_points: torch.Tensor = None, past_key_values=None, fusion: Optional[str] = None, use_event: Optional[bool] = None):        
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
         
@@ -111,10 +147,16 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
         for i, frame in enumerate(frames):
             images = frame["img"].unsqueeze(0) 
+            event_voxel = frame.get("event_voxel") if isinstance(frame, dict) else None
+            if event_voxel is not None and event_voxel.dim() == 4:
+                event_voxel = event_voxel.unsqueeze(0)
             aggregator_output = self.aggregator(
-                images, 
+                images,
+                event_voxel=event_voxel,
+                fusion=fusion,
+                use_event=use_event,
                 past_key_values=past_key_values,
-                use_cache=True, 
+                use_cache=True,
                 past_frame_idx=i
             )
             
